@@ -139,12 +139,3 @@ CONVERT_CALLED_STATION_ON_CREATE = get_settings_value(
 OPENVPN_DATETIME_FORMAT = get_settings_value(
     'OPENVPN_DATETIME_FORMAT', u'%a %b %d %H:%M:%S %Y'
 )
-
-OPENWISP_EMAIL_LOGO = getattr(
-    settings,
-    'OPENWISP_EMAIL_LOGO',
-    'https://raw.githubusercontent.com/openwisp/openwisp-utils/master/openwisp_utils/'
-    'static/openwisp-utils/images/openwisp-logo.png',
-)
-
-OPENWISP_HTML_EMAIL = getattr(settings, 'OPENWISP_HTML_EMAIL', True)
