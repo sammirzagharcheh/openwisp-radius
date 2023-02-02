@@ -13,10 +13,10 @@ from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db.utils import IntegrityError
 from django.http import Http404, HttpResponse
-from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.decorators import method_decorator
 from django.utils.translation import gettext_lazy as _
+from django.utils.translation.trans_real import get_language_from_request
 from django.views.decorators.csrf import csrf_exempt
 from django_filters.rest_framework import DjangoFilterBackend
 from drf_yasg.utils import no_body, swagger_auto_schema
@@ -40,13 +40,14 @@ from rest_framework.response import Response
 from rest_framework.throttling import BaseThrottle  # get_ident method
 
 from openwisp_radius.api.serializers import RadiusUserSerializer
-from openwisp_users.api.authentication import BearerAuthentication
+from openwisp_users.api.authentication import BearerAuthentication, SesameAuthentication
 from openwisp_users.api.permissions import IsOrganizationManager
 from openwisp_users.api.views import ChangePasswordView as BasePasswordChangeView
+from openwisp_users.backends import UsersAuthenticationBackend
 
 from .. import settings as app_settings
 from ..exceptions import PhoneTokenException, UserAlreadyVerified
-from ..utils import generate_pdf, load_model
+from ..utils import generate_pdf, get_organization_radius_settings, load_model
 from . import freeradius_views
 from .freeradius_views import AccountingFilter, AccountingViewPagination
 from .permissions import IsRegistrationEnabled, IsSmsVerificationEnabled
@@ -58,7 +59,7 @@ from .serializers import (
     ValidatePhoneTokenSerializer,
 )
 from .swagger import ObtainTokenRequest, ObtainTokenResponse, RegisterResponse
-from .utils import ErrorDictMixin, IDVerificationHelper, is_registration_enabled
+from .utils import ErrorDictMixin, IDVerificationHelper
 
 authorize = freeradius_views.authorize
 postauth = freeradius_views.postauth
@@ -75,8 +76,7 @@ PhoneToken = load_model('PhoneToken')
 RadiusAccounting = load_model('RadiusAccounting')
 RadiusToken = load_model('RadiusToken')
 RadiusBatch = load_model('RadiusBatch')
-OrganizationRadiusSettings = load_model('OrganizationRadiusSettings')
-RegisteredUser = load_model('RegisteredUser')
+auth_backend = UsersAuthenticationBackend()
 
 
 class ThrottledAPIMixin(object):
@@ -159,6 +159,17 @@ class DownloadRadiusBatchPdfView(ThrottledAPIMixin, DispatchOrgMixin, RetrieveAP
 download_rad_batch_pdf = DownloadRadiusBatchPdfView.as_view()
 
 
+class UserDetailsUpdaterMixin(object):
+    def update_user_details(self, user):
+        language = get_language_from_request(self.request)
+        update_fields = ['last_login']
+        if user.language != language:
+            user.language = language
+            update_fields.append('language')
+        user.last_login = timezone.now()
+        user.save(update_fields=update_fields)
+
+
 class RadiusTokenMixin(object):
     def _radius_accounting_nas_stop(self, user, organization):
         """
@@ -218,10 +229,6 @@ class RadiusTokenMixin(object):
             cache.set(f'rt-{user.username}', str(organization.pk), 86400)
         return radius_token
 
-    def update_user_last_login(self, user):
-        user.last_login = timezone.now()
-        user.save(update_fields=['last_login'])
-
 
 @method_decorator(
     name='post',
@@ -251,12 +258,16 @@ register = RegisterView.as_view()
 
 
 class ObtainAuthTokenView(
-    DispatchOrgMixin, RadiusTokenMixin, BaseObtainAuthToken, IDVerificationHelper
+    DispatchOrgMixin,
+    RadiusTokenMixin,
+    BaseObtainAuthToken,
+    IDVerificationHelper,
+    UserDetailsUpdaterMixin,
 ):
     throttle_scope = 'obtain_auth_token'
     serializer_class = rest_auth_settings.TokenSerializer
     auth_serializer_class = AuthTokenSerializer
-    authentication_classes = []
+    authentication_classes = [SesameAuthentication]
 
     @method_decorator(csrf_exempt)
     def dispatch(self, request, *args, **kwargs):
@@ -269,14 +280,16 @@ class ObtainAuthTokenView(
         """
         Obtain the user radius token required for authentication in APIs.
         """
-        serializer = self.auth_serializer_class(
-            data=request.data, context={'request': request}
-        )
-        serializer.is_valid(raise_exception=True)
-        user = self.get_user(serializer, *args, **kwargs)
+        user = request.user
+        if user.is_anonymous:
+            serializer = self.auth_serializer_class(
+                data=request.data, context={'request': request}
+            )
+            serializer.is_valid(raise_exception=True)
+            user = self.get_user(serializer, *args, **kwargs)
         token, _ = UserToken.objects.get_or_create(user=user)
         self.get_or_create_radius_token(user, self.organization, renew=renew_required)
-        self.update_user_last_login(user)
+        self.update_user_details(user)
         context = {'view': self, 'request': request}
         serializer = self.serializer_class(instance=token, context=context)
         response = RadiusUserSerializer(user).data
@@ -296,7 +309,9 @@ class ObtainAuthTokenView(
 
     def validate_membership(self, user):
         if not (user.is_superuser or user.is_member(self.organization)):
-            if is_registration_enabled(self.organization):
+            if get_organization_radius_settings(
+                self.organization, 'registration_enabled'
+            ):
                 if self._needs_identity_verification(
                     org=self.organization
                 ) and not self.is_identity_verified_strong(user):
@@ -327,7 +342,11 @@ class ValidateTokenSerializer(serializers.Serializer):
 
 
 class ValidateAuthTokenView(
-    DispatchOrgMixin, RadiusTokenMixin, CreateAPIView, IDVerificationHelper
+    DispatchOrgMixin,
+    RadiusTokenMixin,
+    CreateAPIView,
+    IDVerificationHelper,
+    UserDetailsUpdaterMixin,
 ):
     throttle_scope = 'validate_auth_token'
     serializer_class = ValidateTokenSerializer
@@ -370,7 +389,7 @@ class ValidateAuthTokenView(
                 token_data['auth_token'] = token_data.pop('key')
                 token_data['response_code'] = 'AUTH_TOKEN_VALIDATION_SUCCESSFUL'
                 response.update(token_data)
-                self.update_user_last_login(token.user)
+                self.update_user_details(token.user)
                 return Response(response, 200)
         return Response(response, 401)
 
@@ -401,7 +420,7 @@ class UserAccountingView(ThrottledAPIMixin, DispatchOrgMixin, ListAPIView):
     serializer_class = RadiusAccountingSerializer
     pagination_class = AccountingViewPagination
     filter_backends = (DjangoFilterBackend,)
-    filter_class = UserAccountingFilter
+    filterset_class = UserAccountingFilter
     queryset = RadiusAccounting.objects.all().order_by('-start_time')
 
     def list(self, request, *args, **kwargs):
@@ -450,7 +469,7 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
     @swagger_auto_schema(
         responses={
             200: '`{"detail": "Password reset e-mail has been sent."}`',
-            400: '`{"detail": "The email field is required."}`',
+            400: '`{"detail": "The input field is required."}`',
             404: '`{"detail": "Not found."}`',
         }
     )
@@ -458,6 +477,8 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
         """
         This is the classic "password forgotten recovery feature" which
         sends a reset password token to the email of the user.
+        The input field can be an email, an username or
+        a phone number (if mobile phone verification is in use).
         """
         request.user = self.get_user(request)
         return super().post(request, *args, **kwargs)
@@ -469,14 +490,20 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
         uid = user_pk_to_url_str(user)
         token = default_token_generator.make_token(user)
         password_reset_urls = app_settings.PASSWORD_RESET_URLS
-        default_url = password_reset_urls.get('default')
+        password_reset_url = app_settings.DEFAULT_PASSWORD_RESET_URL
         domain = get_current_site(self.request).domain
         if getattr(self, 'swagger_fake_view', False):
             organization_pk, organization_slug = None, None  # pragma: no cover
         else:
             organization_pk = self.organization.pk
             organization_slug = self.organization.slug
-        password_reset_url = password_reset_urls.get(str(organization_pk), default_url)
+            org_radius_settings = self.organization.radius_settings
+            if org_radius_settings.password_reset_url:
+                password_reset_url = org_radius_settings.password_reset_url
+            else:
+                password_reset_url = password_reset_urls.get(
+                    str(organization_pk), password_reset_url
+                )
         password_reset_url = password_reset_url.format(
             organization=organization_slug, uid=uid, token=token, site=domain
         )
@@ -484,9 +511,11 @@ class PasswordResetView(ThrottledAPIMixin, DispatchOrgMixin, BasePasswordResetVi
         return context
 
     def get_user(self, request):
-        if request.data.get('email', None):
-            email = request.data['email']
-            user = get_object_or_404(User, email=email)
+        if request.data.get('input', None):
+            input = request.data['input']
+            user = auth_backend.get_users(input).first()
+            if user is None:
+                raise Http404('No user was found with given details.')
             self.validate_membership(user)
             return user
         raise ParseError(_('The email field is required.'))
@@ -527,20 +556,6 @@ class PasswordResetConfirmView(
 password_reset_confirm = PasswordResetConfirmView.as_view()
 
 
-@method_decorator(
-    name='post',
-    decorator=swagger_auto_schema(
-        operation_description=(
-            """
-            **Requires the user auth token (Bearer Token).**
-            Used for SMS verification, sends a code via SMS to the
-            phone number of the user.
-            """
-        ),
-        request_body=no_body,
-        responses={201: ''},
-    ),
-)
 class CreatePhoneTokenView(
     ErrorDictMixin, BaseThrottle, DispatchOrgMixin, CreateAPIView
 ):
@@ -551,12 +566,29 @@ class CreatePhoneTokenView(
         IsAuthenticated,
     )
 
+    @swagger_auto_schema(
+        operation_description=(
+            """
+            **Requires the user auth token (Bearer Token).**
+            Used for SMS verification, sends a code via SMS to the
+            phone number of the user.
+            """
+        ),
+        request_body=no_body,
+        responses={201: ''},
+    )
+    def post(self, request, *args, **kwargs):
+        # Required for drf-yasg
+        return super().post(request, *args, **kwargs)
+
     def create(self, *args, **kwargs):
         request = self.request
         self.validate_membership(request.user)
         phone_number = request.data.get('phone_number', request.user.phone_number)
         phone_token = PhoneToken(
-            user=request.user, ip=self.get_ident(request), phone_number=phone_number,
+            user=request.user,
+            ip=self.get_ident(request),
+            phone_number=phone_number,
         )
         try:
             phone_token.full_clean()
@@ -620,15 +652,23 @@ class ValidatePhoneTokenView(DispatchOrgMixin, GenericAPIView):
             user.phone_number = phone_token.phone_number
             user.save()
             user.registered_user.save()
+            # delete any radius token cache key if present
+            cache.delete(f'rt-{phone_token.phone_number}')
             return Response(None, status=200)
 
 
 validate_phone_token = ValidatePhoneTokenView.as_view()
 
 
-@method_decorator(
-    name='post',
-    decorator=swagger_auto_schema(
+class ChangePhoneNumberView(ThrottledAPIMixin, CreatePhoneTokenView):
+    authentication_classes = (BearerAuthentication,)
+    permission_classes = (
+        IsSmsVerificationEnabled,
+        IsAuthenticated,
+    )
+    serializer_class = ChangePhoneNumberSerializer
+
+    @swagger_auto_schema(
         operation_description=(
             """
             **Requires the user auth token (Bearer Token).**
@@ -637,15 +677,10 @@ validate_phone_token = ValidatePhoneTokenView.as_view()
             """
         ),
         responses={200: ''},
-    ),
-)
-class ChangePhoneNumberView(ThrottledAPIMixin, CreatePhoneTokenView):
-    authentication_classes = (BearerAuthentication,)
-    permission_classes = (
-        IsSmsVerificationEnabled,
-        IsAuthenticated,
     )
-    serializer_class = ChangePhoneNumberSerializer
+    def post(self, request, *args, **kwargs):
+        # Required for drf-yasg
+        return super().post(request, *args, **kwargs)
 
     def create(self, *args, **kwargs):
         serializer = self.get_serializer(

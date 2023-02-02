@@ -1,6 +1,17 @@
+.. _saml_:
+
 =====================
 Single Sign-On (SAML)
 =====================
+
+.. important::
+
+    The SAML registration method is disabled by default.
+
+    In order to enable this feature you have to follow
+    the :ref:`SAML setup instructions <setup_saml>` below
+    and then activate it via :ref:`global setting or from the admin interface
+    <openwisp_radius_saml_registration_enabled>`.
 
 `SAML <http://saml.xml.org/about-saml>`_ is supported by generating
 an additional temporary token right after users authenticates via SSO,
@@ -18,7 +29,7 @@ while ``token`` should be used for the password field.
 
 The third parameter, ``login_method=saml``, is needed because it allows
 the captive page to remember that the user logged in via SAML,
-because it will need to perform the `SAML logout <#logout>`_ later on.
+because it will need to perform the :ref:`SAML logout <logout>` later on.
 
 The internal REST API of openwisp-radius will recognize the token and authorize
 the user.
@@ -32,6 +43,8 @@ a SSO.
    If you're building a public wifi service, we suggest
    to take a look at `openwisp-wifi-login-pages <https://github.com/openwisp/openwisp-wifi-login-pages>`_,
    which is built to work with openwisp-radius.
+
+.. _setup_saml:
 
 Setup
 -----
@@ -63,7 +76,7 @@ Ensure your ``settings.py`` looks like the following:
     # Update AUTHENTICATION_BACKENDS
     AUTHENTICATION_BACKENDS = (
         'openwisp_users.backends.UsersAuthenticationBackend',
-        'djangosaml2.backends.Saml2Backend', # <- add for SAML login
+        'openwisp_radius.saml.backends.OpenwispRadiusSaml2Backend', # <- add for SAML login
     )
 
     # Update MIDDLEWARE
@@ -81,8 +94,8 @@ Ensure your main ``urls.py`` contains the ``openwisp_users.accounts.urls``:
         path('accounts/', include('openwisp_users.accounts.urls')),
     ]
 
-Configure the SAML Settings
----------------------------
+Configure the djangosaml2 settings
+----------------------------------
 
 Refer to the djangosaml2 documentation to find out `how to configure
 required settings for SAML
@@ -112,6 +125,8 @@ Alternatively, you can take a look at
 `openwisp-wifi-login-pages <https://github.com/openwisp/openwisp-wifi-login-pages>`_,
 which provides buttons for Single Sign-On (SAML) by default.
 
+.. _logout:
+
 Logout
 ------
 
@@ -120,26 +135,34 @@ should also call the SAML logout URL: ``/radius/saml2/logout/``.
 
 The `openwisp-wifi-login-pages <https://github.com/openwisp/openwisp-wifi-login-pages>`_
 app supports this with minimal configuration, refer to the
-`"Configuring SAML Login & Logout" <https://github.com/openwisp/openwisp-wifi-login-pages##configuring-saml-login--logout>`_
+`"Configuring SAML Login & Logout" <https://github.com/openwisp/openwisp-wifi-login-pages#configuring-saml-login--logout>`_
 section.
 
 Settings
 --------
 
-``OPENWISP_RADIUS_SAML_REGISTRATION_METHOD_LABEL``
+See :ref:`SAML related settings <saml_settings>`.
+
+FAQs
+----
+
+.. _preventing_change_in_username_of_registered_user:
+
+Preventing change in username of a registered user
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-**Default**: ``'Single Sign-On (SAML)'``
+The ``djangosaml2`` library requires configuring ``SAML_DJANGO_USER_MAIN_ATTRIBUTE``
+setting which serves as the primary lookup value for User objects.
+Whenever a user logs in or registers through the SAML method,
+a database query is made to check whether such a user already exists.
+This lookup is done using the value of ``SAML_DJANGO_USER_MAIN_ATTRIBUTE`` setting.
+If a match is found, the details of the user are updated with the
+information received from SAML Identity Provider.
 
-Sets the verbose name of SAML registration method.
-
-``OPENWISP_RADIUS_SAML_IS_VERIFIED``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-**Default**: ``False``
-
-Setting this to ``True`` will automatically flag user accounts
-created during SAML sign-in as verified users (``RegisteredUser.is_verified=True``).
-
-This is useful when SAML identity providers can be trusted
-to be legally valid identity verifiers.
+If a user (who has registered on OpenWISP with a different method from SAML)
+logs into OpenWISP with SAML, then the default behaviour of OpenWISP RADIUS
+prevents updating username of this user. Because, this operation could
+render the user's old credentials useless. If you want to update the username
+in such scenarios with details received from Identity Provider, set
+:ref:`OPENWISP_RADIUS_SAML_UPDATES_PRE_EXISTING_USERNAME <openwisp_radius_saml_updates_pre_existing_username>`
+to ``True``.

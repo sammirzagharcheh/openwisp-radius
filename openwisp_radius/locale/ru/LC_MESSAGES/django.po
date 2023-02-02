@@ -5,13 +5,12 @@
 #
 msgid ""
 msgstr ""
-"Language: \n"
+"Language: ru\n"
 "MIME-Version: 1.0\n"
 "Content-Type: text/plain; charset=UTF-8\n"
 "Content-Transfer-Encoding: 8bit\n"
 "Plural-Forms: nplurals=3; plural=(n%10==1 && n%100!=11 ? 0 : n%10>=2 && n%10<=4 "
 "&& (n%100<12 || n%100>14) ? 1 : 2);\n"
-"X-Generator: Poedit 3.0\n"
 
 #: openwisp_radius/api/serializers.py:71
 msgid "The credentials entered are not valid. Please double-check and try again."
@@ -23,7 +22,7 @@ msgstr "Нужен включать \"username\" и \"password\"."
 
 #: openwisp_radius/api/serializers.py:355 openwisp_radius/api/serializers.py:383
 msgid "This field is required."
-msgstr "Обязательное поле."
+msgstr "Обязательное."
 
 #: openwisp_radius/api/serializers.py:363
 msgid "A user is already registered with this phone number."
@@ -44,7 +43,7 @@ msgstr "Емайл обязательно для заполнения."
 
 #: openwisp_radius/api/views.py:570
 msgid "No verification code found in the system for this user."
-msgstr "Не найдено проверочного кода для этого пользователя."
+msgstr "Не найдено проверочного код для этого пользователя."
 
 #: openwisp_radius/api/views.py:577
 msgid "Invalid code."
@@ -75,11 +74,11 @@ msgstr "Проверочный код {organization}: {code}"
 
 #: openwisp_radius/base/models.py:1335
 msgid "This user has been already verified."
-msgstr "Этот пользователь уже верифицирован."
+msgstr "Этот пользователь уже был проверен."
 
 #: openwisp_radius/base/models.py:1350
 msgid "Maximum number of attempts reached, request a new code."
-msgstr "Достигнуто максимальное количество попыток, запросите новый код."
+msgstr "Максимальное количество достигнутых попыток, запросите новый код."
 
 #: openwisp_radius/base/models.py:1364
 msgid "This verification code has expired, Please send a new code and try again."
@@ -90,17 +89,13 @@ msgstr ""
 #: openwisp_radius/templates/custom_password_reset_email.html:2
 #, python-format
 msgid ""
-"You're receiving this email because you requested a password reset for your user "
-"account at\n"
+"You're receiving this email because you requested a password reset for your "
+"user account at\n"
 "%(site_name)s."
 msgstr ""
 "Вы получаете это письмо, потому что запросили сброс пароля для своей учетной "
 "записи пользователя по адресу\n"
 "%(site_name)s."
-
-#: openwisp_radius/templates/custom_password_reset_email.html:5
-msgid "Please go to the following page and choose a new password:"
-msgstr "Открытие следующей страницы для выбора нового пароля:"
 
 #: openwisp_radius/templates/custom_password_reset_email.html:10
 msgid "Your username, in case you've forgotten:"
@@ -109,3 +104,38 @@ msgstr "Ваше имя пользователя, если вы его забы�
 #: openwisp_radius/templates/custom_password_reset_email.html:12
 msgid "Best regards"
 msgstr "С уважением"
+
+#: openwisp_radius/templates/custom_password_reset_email.html:14
+msgid ""
+"Please click on the button below to open a page where you can choose a new "
+"password:"
+msgstr "Нажмите кнопку ниже, чтобы открыть страницу, где вы можете выбрать новый пароль:"
+
+#: openwisp_radius/api/serializers.py:378
+msgid "Reset password"
+msgstr "Изменить пароль"
+
+#: openwisp_radius/api/serializers.py:364
+#, python-format
+msgid "Password reset on %s"
+msgstr "Ставить пароль на %s"
+
+#: openwisp_radius/templates/radius_accounting_start.html:3
+msgid "A new session has been started for your account:"
+msgstr "Для вашей учетной записи началася новую сессию:"
+
+#: openwisp_radius/templates/radius_accounting_start.html:4
+msgid "You can review your session to find out how much time and/or traffic has been used or you can terminate the session at any time by clicking on the button below."
+msgstr "Вы можете отслеживать время и потребление трафика вашей сессии или завершить сессию в любое время, нажав на следующую ссылку."
+
+#: openwisp_radius/templates/radius_accounting_start.html:5
+msgid "Note: this link is valid only for %(sesame_max_age)s"
+msgstr "Примечание: эта ссылка действительна только в течение %(sesame_max_age)s"
+
+#: openwisp_radius/tasks.py:75
+msgid "Manage Session"
+msgstr "Управление сессией"
+
+#: openwisp_radius/tasks.py:80
+msgid "New WiFi session started"
+msgstr "Начала новая сессия WiFi"

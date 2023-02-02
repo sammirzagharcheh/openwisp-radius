@@ -5,7 +5,7 @@ from unittest.mock import patch
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.management import CommandError, call_command
-from django.utils.timezone import now
+from django.utils.timezone import get_default_timezone, now
 from netaddr import EUI, mac_unix
 from openvpn_status.models import Routing
 
@@ -27,13 +27,64 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
     @capture_any_output()
     def test_cleanup_stale_radacct_command(self):
         options = _RADACCT.copy()
-        options['unique_id'] = '117'
-        self._create_radius_accounting(**options)
-        call_command('cleanup_stale_radacct', 30)
-        session = RadiusAccounting.objects.get(unique_id='117')
-        self.assertNotEqual(session.stop_time, None)
-        self.assertNotEqual(session.session_time, None)
-        self.assertEqual(session.update_time, session.stop_time)
+
+        with self.subTest(
+            'Test update_time unset and start_time older than specified time'
+        ):
+            options['unique_id'] = '117'
+            options['update_time'] = None
+            options['start_time'] = '2017-06-10 10:50:00'
+            self._create_radius_accounting(**options)
+            call_command('cleanup_stale_radacct', 1)
+            session = RadiusAccounting.objects.get(unique_id='117')
+            self.assertNotEqual(session.stop_time, None)
+            self.assertNotEqual(session.session_time, None)
+            self.assertEqual(session.update_time, session.stop_time)
+            self.assertEqual(session.terminate_cause, 'Session Timeout')
+
+        with self.subTest(
+            'Test start_time older than specified time but update_time is recent'
+        ):
+            update_time = now()
+            options['unique_id'] = '118'
+            options['start_time'] = '2017-06-10 10:50:00'
+            options['update_time'] = str(update_time)
+            self._create_radius_accounting(**options)
+            call_command('cleanup_stale_radacct', 1)
+            session = RadiusAccounting.objects.get(unique_id='118')
+            self.assertEqual(session.stop_time, None)
+            self.assertEqual(session.session_time, None)
+            self.assertEqual(session.update_time, update_time)
+            self.assertEqual(session.terminate_cause, None)
+
+        with self.subTest('Test start_time and update_time older than specified time'):
+            options['unique_id'] = '119'
+            options['update_time'] = '2017-06-10 10:50:00'
+            options['start_time'] = '2017-06-10 10:50:00'
+            self._create_radius_accounting(**options)
+            call_command('cleanup_stale_radacct', 1)
+            session = RadiusAccounting.objects.get(unique_id='119')
+            self.assertNotEqual(session.stop_time, None)
+            self.assertNotEqual(session.session_time, None)
+            self.assertEqual(session.update_time, session.stop_time)
+            self.assertEqual(session.terminate_cause, 'Session Timeout')
+
+        with self.subTest('Test does not affect closed session'):
+            options['unique_id'] = '120'
+            options['start_time'] = '2017-06-10 10:50:00'
+            options['update_time'] = '2017-06-10 10:55:00'
+            options['stop_time'] = '2017-06-10 10:55:00'
+            self._create_radius_accounting(**options)
+            call_command('cleanup_stale_radacct', 1)
+            session = RadiusAccounting.objects.get(unique_id='120')
+            self.assertEqual(
+                session.stop_time.astimezone(get_default_timezone()).strftime(
+                    '%Y-%m-%d %H:%M:%S'
+                ),
+                '2017-06-10 10:55:00',
+            )
+            self.assertEqual(session.update_time, session.stop_time)
+            self.assertNotEqual(session.terminate_cause, 'Session Timeout')
 
     @capture_any_output()
     def test_delete_old_postauth_command(self):
@@ -169,13 +220,17 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
             User.objects.all().delete()
             RadiusBatch.objects.all().delete()
             path = self._get_path('static/test_batch.csv')
-            options = dict(organization=self.default_org.slug, file=path, name='test',)
+            options = dict(
+                organization=self.default_org.slug,
+                file=path,
+                name='test',
+            )
             self._call_command('batch_add_users', **options)
             User.objects.update(date_joined=now() - timedelta(days=3))
             for user in User.objects.all():
-                RegisteredUser.objects.create(
-                    user=user, method='email', is_verified=False
-                )
+                user.registered_user.is_verified = False
+                user.registered_user.method = 'email'
+                user.registered_user.save(update_fields=['is_verified', 'method'])
 
         with self.subTest('Delete unverified users older than 2 days'):
             _create_old_users()
@@ -216,9 +271,54 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
                 is_verified=True,
             )
             self.assertEqual(User.objects.count(), 4)
-            call_command('delete_unverified_users',)
+            call_command(
+                'delete_unverified_users',
+            )
             self.assertEqual(User.objects.count(), 1)
 
+        with self.subTest('Users which have accounting sessions should not be deleted'):
+            _create_old_users()
+            user = self._create_user(date_joined=now() - timedelta(days=3))
+            RegisteredUser.objects.create(
+                user=user,
+                method='email',
+                is_verified=False,
+            )
+            opts = _RADACCT.copy()
+            opts['unique_id'] = 1
+            opts['username'] = user.username
+            self._create_radius_accounting(**opts)
+            self.assertEqual(User.objects.count(), 4)
+            call_command(
+                'delete_unverified_users',
+            )
+            self.assertEqual(User.objects.count(), 1)
+            self.assertEqual(
+                RadiusAccounting.objects.filter(username=opts['username']).exists(),
+                True,
+            )
+
+        with self.subTest('Staff users should not be deleted'):
+            _create_old_users()
+            user = self._create_user(
+                date_joined=now() - timedelta(days=3), is_staff=True
+            )
+            RegisteredUser.objects.create(
+                user=user,
+                method='email',
+                is_verified=False,
+            )
+            self.assertEqual(User.objects.count(), 4)
+            call_command(
+                'delete_unverified_users',
+            )
+            self.assertEqual(User.objects.count(), 1)
+            self.assertEqual(
+                User.objects.filter(username=user.username, is_staff=True).exists(),
+                True,
+            )
+
+    @capture_any_output()
     @patch.object(
         app_settings,
         'CALLED_STATION_IDS',
@@ -242,7 +342,7 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
         radius_acc = self._create_radius_accounting(**options)
 
         with self.subTest('Test telnet connection error'):
-            with patch('logging.Logger.error') as mocked_logger:
+            with patch('logging.Logger.warning') as mocked_logger:
                 call_command('convert_called_station_id')
                 mocked_logger.assert_called_once_with(
                     'Unable to establish telnet connection to 127.0.0.1 on 7505. '
@@ -250,7 +350,7 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
                 )
 
         with self.subTest('Test telnet raises OSError'):
-            with patch('logging.Logger.error') as mocked_logger, patch(
+            with patch('logging.Logger.warning') as mocked_logger, patch(
                 'openwisp_radius.management.commands.base.convert_called_station_id'
                 '.BaseConvertCalledStationIdCommand._get_raw_management_info',
                 side_effect=OSError('[Errno 113] No route to host'),
@@ -262,14 +362,15 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
                 )
 
         with self.subTest('Test telnet connection timed out'):
-            with patch('logging.Logger.exception') as mocked_logger, patch(
+            with patch('logging.Logger.warning') as mocked_logger, patch(
                 'openwisp_radius.management.commands.base.convert_called_station_id'
                 '.BaseConvertCalledStationIdCommand._get_raw_management_info',
-                side_effect=EOFError,
+                side_effect=EOFError('EOFError'),
             ):
                 call_command('convert_called_station_id')
                 mocked_logger.assert_called_once_with(
-                    'Error encountered while connecting to 127.0.0.1:7505. ' 'Skipping!'
+                    'Error encountered while connecting to 127.0.0.1:7505: '
+                    'EOFError. Skipping!'
                 )
 
         with self.subTest('Test telnet password incorrect'):
@@ -279,10 +380,10 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
                 'openwisp_radius.management.commands.base.convert_called_station_id'
                 '.BaseConvertCalledStationIdCommand._get_raw_management_info',
                 return_value='PASSWORD:',
-            ), patch('logging.Logger.error') as mocked_logger:
+            ), patch('logging.Logger.warning') as mocked_logger:
                 call_command('convert_called_station_id')
                 mocked_logger.assert_called_once_with(
-                    'Unable to parse information received from 127.0.0.1. '
+                    'Unable to parse information received from 127.0.0.1:7505. '
                     'ParsingError: expected \'OpenVPN CLIENT LIST\' but got '
                     '\'PASSWORD:\'. Skipping!'
                 )
@@ -295,7 +396,7 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
             ), patch('logging.Logger.info') as mocked_logger:
                 call_command('convert_called_station_id')
                 mocked_logger.assert_called_once_with(
-                    'No routing information found for organization with "test-org" slug'
+                    'No routing information found for "test-org" organization'
                 )
 
         with self.subTest('Test client common name does not contain a MAC address'):
@@ -305,7 +406,7 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
                 'openwisp_radius.management.commands.base.convert_called_station_id'
                 '.BaseConvertCalledStationIdCommand._get_openvpn_routing_info',
                 return_value={options['calling_station_id']: dummy_routing_obj},
-            ), patch('logging.Logger.warn') as mocked_logger:
+            ), patch('logging.Logger.warning') as mocked_logger:
                 call_command('convert_called_station_id')
                 mocked_logger.assert_called_once_with(
                     f'Failed to find a MAC address in "{dummy_routing_obj.common_name}"'
@@ -317,7 +418,7 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
                 'openwisp_radius.management.commands.base.convert_called_station_id'
                 '.BaseConvertCalledStationIdCommand._get_openvpn_routing_info',
                 return_value={'dd:dd:dd:dd:dd:dd': Routing()},
-            ), patch('logging.Logger.warn') as mocked_logger:
+            ), patch('logging.Logger.warning') as mocked_logger:
                 call_command('convert_called_station_id')
                 mocked_logger.assert_called_once_with(
                     f'Failed to find routing information for {radius_acc.session_id}.'
@@ -331,7 +432,7 @@ class TestCommands(FileMixin, CallCommandMixin, BaseTestCase):
             self.assertEqual(radius_acc.called_station_id, 'CC-CC-CC-CC-CC-0C')
 
         with self.subTest('Test session with unique_id does not exist'):
-            with patch('logging.Logger.error') as mocked_logger:
+            with patch('logging.Logger.warning') as mocked_logger:
                 call_command('convert_called_station_id', unique_id='111')
                 mocked_logger.assert_called_once_with(
                     'RadiusAccount object with unique_id "111" does not exist.'

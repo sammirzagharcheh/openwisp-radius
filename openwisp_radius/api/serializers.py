@@ -13,6 +13,7 @@ from dj_rest_auth.serializers import (
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Group
+from django.contrib.sites.shortcuts import get_current_site
 from django.core.exceptions import ValidationError
 from django.db.models import Q
 from django.urls import reverse
@@ -31,8 +32,8 @@ from openwisp_users.backends import UsersAuthenticationBackend
 from .. import settings as app_settings
 from ..base.forms import PasswordResetForm
 from ..registration import REGISTRATION_METHOD_CHOICES
-from ..utils import load_model
-from .utils import ErrorDictMixin, IDVerificationHelper, is_sms_verification_enabled
+from ..utils import get_organization_radius_settings, load_model
+from .utils import ErrorDictMixin, IDVerificationHelper
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +91,9 @@ class AllowedMobilePrefixMixin(object):
         Verifies if a phone number's international prefix is allowed
         """
         country_code = phonenumbers.parse(str(phone_number)).country_code
-        allowed_global_prefixes = set(app_settings.ALLOWED_MOBILE_PREFIXES)
-        allowed_org_prefixes = set(mobile_prefixes)
-        allowed_prefixes = allowed_global_prefixes.union(allowed_org_prefixes)
-        if not allowed_prefixes:
+        if not mobile_prefixes:
             return True
-        return ('+' + str(country_code)) in allowed_prefixes
+        return '+' + str(country_code) in mobile_prefixes
 
 
 class AuthorizeSerializer(serializers.Serializer):
@@ -154,7 +152,13 @@ class RadiusAccountingSerializer(serializers.ModelSerializer):
         write_only=True, required=True, choices=STATUS_TYPE_CHOICES
     )
 
-    def _disable_token_auth(self, user):
+    def _disable_radius_token_auth(self, user):
+        """
+        Disables radius token auth capability unless
+        OPENWISP_RADIUS_DISPOSABLE_RADIUS_USER_TOKEN is False
+        """
+        if not app_settings.DISPOSABLE_RADIUS_USER_TOKEN:
+            return
         try:
             radius_token = RadiusToken.objects.get(user__username=user)
         except RadiusToken.DoesNotExist:
@@ -162,6 +166,19 @@ class RadiusAccountingSerializer(serializers.ModelSerializer):
         else:
             radius_token.can_auth = False
             radius_token.save()
+
+    def is_valid(self, raise_exception=False):
+        try:
+            return super().is_valid(raise_exception)
+        except serializers.ValidationError as error:
+            request = self.context.get('request', None)
+            if request:
+                logger.warn(
+                    'Freeradius accounting request failed.\n'
+                    f'Error: {error}\n'
+                    f'Request payload: {request.data}'
+                )
+            raise error
 
     def run_validation(self, data):
         for field in ['session_time', 'input_octets', 'output_octets']:
@@ -187,8 +204,7 @@ class RadiusAccountingSerializer(serializers.ModelSerializer):
         if status_type == 'Stop':
             data['update_time'] = time
             data['stop_time'] = time
-            # disable radius_token auth capability
-            self._disable_token_auth(data['username'])
+            self._disable_radius_token_auth(data['username'])
         return data
 
     def create(self, validated_data):
@@ -226,12 +242,17 @@ class RadiusAccountingSerializer(serializers.ModelSerializer):
         if not ids or instance.called_station_id == acct_data['called_station_id']:
             return acct_data
         try:
+            organization = acct_data['organization']
             if (
                 ids
-                and acct_data['organization']
-                and acct_data['organization'].slug in ids
+                and organization
+                and (organization.slug in ids or str(organization.id) in ids)
             ):
-                unconverted_ids = ids[acct_data['organization'].slug]['unconverted_ids']
+                # organization slug is maintained for backward compatibility
+                # but will removed in future versions
+                unconverted_ids = ids.get(str(organization.id), {}).get(
+                    'unconverted_ids', []
+                ) + ids.get(organization.slug, {}).get('unconverted_ids', [])
                 if acct_data['called_station_id'] in unconverted_ids:
                     acct_data['called_station_id'] = instance.called_station_id
         except Exception:
@@ -280,7 +301,10 @@ class RadiusBatchSerializer(serializers.ModelSerializer):
         slug_field='slug',
         write_only=True,
     )
-    users = UserSerializer(many=True, read_only=True,)
+    users = UserSerializer(
+        many=True,
+        read_only=True,
+    )
     prefix = serializers.CharField(
         help_text=(
             'Prefix for creating usernames. '
@@ -345,7 +369,17 @@ class RadiusBatchSerializer(serializers.ModelSerializer):
 
 
 class PasswordResetSerializer(BasePasswordResetSerializer):
+    input = serializers.CharField()
+    email = None
     password_reset_form_class = PasswordResetForm
+
+    def validate_input(self, value):
+        # Create PasswordResetForm with the serializer.
+        # Check BasePasswordResetSerializer.validate_email for details.
+        user = self.context.get('request').user
+        self.reset_form = self.password_reset_form_class(data={'email': user.email})
+        self.reset_form.is_valid()
+        return value
 
     def save(self):
         request = self.context.get('request')
@@ -356,7 +390,11 @@ class PasswordResetSerializer(BasePasswordResetSerializer):
             'from_email': getattr(settings, 'DEFAULT_FROM_EMAIL'),
             'email_template_name': ('custom_password_reset_email.html'),
             'request': request,
-            'extra_email_context': {'password_reset_url': password_reset_url},
+            'extra_email_context': {
+                'subject': _('Password reset on %s') % (get_current_site(request).name),
+                'call_to_action_url': password_reset_url,
+                'call_to_action_text': _('Reset password'),
+            },
         }
         opts.update(self.get_email_options())
         self.reset_form.save(**opts)
@@ -391,7 +429,7 @@ class RegisterSerializer(
 
     def validate_phone_number(self, phone_number):
         org = self.context['view'].organization
-        if is_sms_verification_enabled(org):
+        if get_organization_radius_settings(org, 'sms_verification'):
             if not phone_number:
                 raise serializers.ValidationError(_('This field is required.'))
             mobile_prefixes = org.radius_settings.allowed_mobile_prefixes_list
@@ -440,25 +478,31 @@ class RegisterSerializer(
             return key in error_dict and key in data
 
         user_lookup = Q()
+        # Phone number is given preference over email and username.
+        if has_key('phone_number'):
+            user_lookup |= Q(phone_number=data['phone_number'])
         if has_key('username'):
             user_lookup |= Q(username=data['username'])
         if has_key('email'):
             user_lookup |= Q(email=data['email'])
-        if has_key('phone_number'):
-            user_lookup |= Q(phone_number=data['phone_number'])
-        try:
-            user = User.objects.get(user_lookup)
-        except User.DoesNotExist:
+        users = User.objects.filter(user_lookup).values_list('id', flat=True)
+        if not users:
             # Error is not related to cross organization registration
             raise error
+        # More that one user objects might be returned if a user
+        # supplies information that belongs to two different accounts.
+        # We ensure that none of the returned accounts belongs to the
+        # current organization and selects the first one based on query
+        # preference.
         if OrganizationUser.objects.filter(
-            organization=self.context['view'].organization, user=user,
+            organization=self.context['view'].organization,
+            user_id__in=users,
         ).exists():
             # User is registering to the organization it is already member of.
             raise error
-
+        user_id = users[0]
         organizations = (
-            OrganizationUser.objects.filter(user=user)
+            OrganizationUser.objects.filter(user_id=user_id)
             .select_related('organization')
             .values('organization__name', 'organization__slug')
         )
@@ -490,7 +534,8 @@ class RegisterSerializer(
         self.custom_signup(request, user)
         # create a RegisteredUser object for every user that registers through API
         RegisteredUser.objects.create(
-            user=user, method=self.validated_data['method'],
+            user=user,
+            method=self.validated_data['method'],
         )
         setup_user_email(request, user, [])
         return user
@@ -563,7 +608,10 @@ class RadiusUserSerializer(serializers.ModelSerializer):
     """
 
     is_verified = serializers.BooleanField(source='registered_user.is_verified')
-    method = serializers.CharField(source='registered_user.method', allow_null=True,)
+    method = serializers.CharField(
+        source='registered_user.method',
+        allow_null=True,
+    )
     radius_user_token = serializers.CharField(source='radius_token.key', default=None)
 
     class Meta:

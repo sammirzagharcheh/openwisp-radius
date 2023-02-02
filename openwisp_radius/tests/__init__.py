@@ -10,7 +10,6 @@ from django.core.management import call_command
 
 from openwisp_users.tests.utils import TestOrganizationMixin
 
-from ..base.models import _encode_secret
 from ..utils import load_model
 
 # it's 21 of April on UTC, this date is fabricated on purpose
@@ -26,6 +25,14 @@ _RADACCT = {
     'input_octets': '1',
     'output_octets': '4',
     'session_id': uuid4().int,
+}
+_CALLED_STATION_IDS = {
+    'test-org': {
+        'openvpn_config': [
+            {'host': '127.0.0.1', 'port': 7505, 'password': 'somepassword'}
+        ],
+        'unconverted_ids': ['AA-AA-AA-AA-AA-0A'],
+    }
 }
 
 Nas = load_model('Nas')
@@ -65,8 +72,6 @@ class CreateRadiusObjectsMixin(TestOrganizationMixin):
         return options
 
     def _create_radius_check(self, **kwargs):
-        if kwargs.get('value'):
-            kwargs['value'] = _encode_secret(kwargs['attribute'], kwargs.get('value'))
         options = self._get_defaults(kwargs)
         rc = RadiusCheck(**options)
         rc.full_clean()

@@ -1,5 +1,6 @@
 from unittest import mock
 
+import lxml.html as lxml_html
 import swapper
 from django.contrib.auth import get_user_model
 from django.contrib.auth.models import Permission
@@ -38,9 +39,10 @@ _RADCHECK_ENTRY = {
 }
 _RADCHECK_ENTRY_PW_UPDATE = {
     'username': 'Monica',
-    'new_value': 'Cam0_liX',
+    'value': 'Cam0_liX',
     'attribute': 'NT-Password',
 }
+PASSWORD_RESET_URL = app_settings.DEFAULT_PASSWORD_RESET_URL
 
 
 class TestAdmin(
@@ -54,16 +56,6 @@ class TestAdmin(
     app_label = 'openwisp_radius'
     app_label_users = 'openwisp_users'
 
-    operator_permission_filters = [
-        {'codename__endswith': 'nas'},
-        {'codename__endswith': 'accounting'},
-        {'codename__endswith': 'batch'},
-        {'codename__endswith': 'check'},
-        {'codename__endswith': 'reply'},
-        {'codename__endswith': 'group'},
-        {'codename__endswith': 'user'},
-    ]
-
     _RADCHECK_ENTRY = {
         'username': 'Monica',
         'value': 'Cam0_liX',
@@ -75,7 +67,7 @@ class TestAdmin(
     def _RADCHECK_ENTRY_PW_UPDATE(self):
         return {
             'username': 'Monica',
-            'new_value': 'Cam0_liX',
+            'value': 'Cam0_liX',
             'attribute': 'NT-Password',
             'op': ':=',
             'organization': str(self.default_org.pk),
@@ -115,13 +107,30 @@ class TestAdmin(
         self.assertContains(response, 'ok')
         self.assertNotContains(response, 'errors')
 
+    def test_radiusreply_add_when_organization_field_empty(self):
+        data = dict(
+            username='bob', attribute='Cleartext-Password', op=':=', value='passbob'
+        )
+        url = reverse(f'admin:{self.app_label}_radiusreply_add')
+        self.assertEqual(RadiusReply.objects.count(), 0)
+        # try to post data without an organisation field
+        response = self.client.post(url, data)
+        # response should contain errors
+        self.assertContains(response, 'errors')
+        self.assertContains(response, 'This field is required.')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RadiusReply.objects.count(), 0)
+
     def test_radiusgroupreply_change(self):
         options = dict(
             groupname='students', attribute='Cleartext-Password', op=':=', value='PPP'
         )
         obj = self._create_radius_groupreply(**options)
         response = self.client.get(
-            reverse(f'admin:{self.app_label}_radiusgroupreply_change', args=[obj.pk],)
+            reverse(
+                f'admin:{self.app_label}_radiusgroupreply_change',
+                args=[obj.pk],
+            )
         )
 
         self.assertContains(response, 'ok')
@@ -133,7 +142,10 @@ class TestAdmin(
         )
         obj = self._create_radius_groupcheck(**options)
         response = self.client.get(
-            reverse(f'admin:{self.app_label}_radiusgroupcheck_change', args=[obj.pk],)
+            reverse(
+                f'admin:{self.app_label}_radiusgroupcheck_change',
+                args=[obj.pk],
+            )
         )
         self.assertContains(response, 'ok')
         self.assertNotContains(response, 'errors')
@@ -166,7 +178,10 @@ class TestAdmin(
         )
         obj = self._create_radius_accounting(**options)
         response = self.client.get(
-            reverse(f'admin:{self.app_label}_radiusaccounting_change', args=[obj.pk],)
+            reverse(
+                f'admin:{self.app_label}_radiusaccounting_change',
+                args=[obj.pk],
+            )
         )
         self.assertContains(response, 'ok')
         self.assertNotContains(response, 'errors')
@@ -192,26 +207,25 @@ class TestAdmin(
         _RADCHECK = self._RADCHECK_ENTRY.copy()
         _RADCHECK['attribute'] = 'Cleartext-Password'
         self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'LM-Password'
-        self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'NT-Password'
-        self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'MD5-Password'
-        self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'SMD5-Password'
-        self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'SHA-Password'
-        self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'SSHA-Password'
-        self._create_radius_check(**_RADCHECK)
-        _RADCHECK['attribute'] = 'Crypt-Password'
-        self._create_radius_check(**_RADCHECK)
         data = self._RADCHECK_ENTRY_PW_UPDATE.copy()
         data['mode'] = 'custom'
         url = reverse(f'admin:{self.app_label}_radiuscheck_change', args=[obj.pk])
         response = self.client.post(url, data, follow=True)
         self.assertContains(response, 'ok')
         self.assertNotContains(response, 'errors')
+
+    def test_radiuscheck_add_when_organization_field_empty(self):
+        data = self._RADCHECK_ENTRY.copy()
+        data['mode'] = 'custom'
+        url = reverse(f'admin:{self.app_label}_radiuscheck_add')
+        self.assertEqual(RadiusCheck.objects.count(), 0)
+        # try to post data without an organisation field
+        response = self.client.post(url, data)
+        # response should contain errors
+        self.assertContains(response, 'errors')
+        self.assertContains(response, 'This field is required.')
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(RadiusCheck.objects.count(), 0)
 
     def test_radiusbatch_change(self):
         obj = self._create_radius_batch(
@@ -235,7 +249,8 @@ class TestAdmin(
         url = reverse(f'admin:{self.app_label}_radiusbatch_change', args=[obj.pk])
         response = self.client.get(url)
         pdf_url = reverse(
-            'radius:download_rad_batch_pdf', args=[obj.organization.slug, obj.pk],
+            'radius:download_rad_batch_pdf',
+            args=[obj.organization.slug, obj.pk],
         )
         self.assertContains(response, pdf_url)
 
@@ -250,27 +265,21 @@ class TestAdmin(
         url = reverse(f'admin:{self.app_label}_radiusbatch_change', args=[obj.pk])
         response = self.client.get(url)
         pdf_url = reverse(
-            'radius:download_rad_batch_pdf', args=[obj.organization.pk, obj.pk],
+            'radius:download_rad_batch_pdf',
+            args=[obj.organization.pk, obj.pk],
         )
         self.assertNotContains(response, pdf_url)
 
     def test_radiuscheck_create_weak_passwd(self):
         _RADCHECK = self._RADCHECK_ENTRY_PW_UPDATE.copy()
-        _RADCHECK['new_value'] = ''
+        _RADCHECK['value'] = ''
         resp = self.client.post(
-            reverse(f'admin:{self.app_label}_radiuscheck_add'), _RADCHECK, follow=True,
+            reverse(f'admin:{self.app_label}_radiuscheck_add'),
+            _RADCHECK,
+            follow=True,
         )
         self.assertEqual(resp.status_code, 200)
         self.assertContains(resp, 'errors')
-
-    def test_radiuscheck_create_disabled_hash(self):
-        data = self._RADCHECK_ENTRY_PW_UPDATE.copy()
-        data['attribute'] = 'Cleartext-Password'
-        data['mode'] = 'custom'
-        url = reverse(f'admin:{self.app_label}_radiuscheck_add')
-        response = self.client.post(url, data, follow=True)
-        self.assertEqual(response.status_code, 200)
-        self.assertNotContains(response, 'errors')
 
     def test_radiuscheck_admin_save_model(self):
         obj = self._create_radius_check(**self._RADCHECK_ENTRY)
@@ -284,60 +293,12 @@ class TestAdmin(
         response = self.client.post(change_url, data, follow=True)
         self.assertNotContains(response, 'errors')
         obj.refresh_from_db()
-        self.assertNotEqual(obj.value, self._RADCHECK_ENTRY['value'])
-        self.assertNotEqual(obj.value, data['new_value'])  # hashed
-        # test also invalid password
-        data['new_value'] = 'cionfrazZ'
+        self.assertEqual(obj.value, data['value'])
+        # test change
+        data['value'] = 'cionfrazZ'
         response = self.client.post(change_url, data, follow=True)
         self.assertEqual(response.status_code, 200)
-        self.assertContains(response, 'errors')
-        self.assertContains(response, 'The secret must contain')
-
-    def test_radiuscheck_enable_disable_action(self):
-        self._create_radius_check(**self._RADCHECK_ENTRY)
-        checks = RadiusCheck.objects.all().values_list('pk', flat=True)
-        change_url = reverse(f'admin:{self.app_label}_radiuscheck_changelist')
-        data = {'action': 'enable_action', '_selected_action': checks}
-        self.client.post(change_url, data, follow=True)
-        data = {'action': 'disable_action', '_selected_action': checks}
-        self.client.post(change_url, data, follow=True)
-        self.assertEqual(RadiusCheck.objects.filter(is_active=True).count(), 0)
-
-    def test_radiuscheck_filter_duplicates_username(self):
-        self._create_radius_check(**self._RADCHECK_ENTRY)
-        self._create_radius_check(**self._RADCHECK_ENTRY)
-        url = (
-            reverse(f'admin:{self.app_label}_radiuscheck_changelist')
-            + '?duplicates=username'
-        )
-        resp = self.client.get(url, follow=True)
-        self.assertEqual(resp.status_code, 200)
-
-    def test_radiuscheck_filter_duplicates_value(self):
-        self._create_radius_check(**self._RADCHECK_ENTRY)
-        self._create_radius_check(**self._RADCHECK_ENTRY)
-        url = (
-            reverse(f'admin:{self.app_label}_radiuscheck_changelist')
-            + '?duplicates=value'
-        )
-        resp = self.client.get(url, follow=True)
-        self.assertEqual(resp.status_code, 200)
-
-    def test_radiuscheck_filter_expired(self):
-        url = (
-            reverse(f'admin:{self.app_label}_radiuscheck_changelist')
-            + '?expired=expired'
-        )
-        resp = self.client.get(url, follow=True)
-        self.assertEqual(resp.status_code, 200)
-
-    def test_radiuscheck_filter_not_expired(self):
-        url = (
-            reverse(f'admin:{self.app_label}_radiuscheck_changelist')
-            + '?expired=not_expired'
-        )
-        resp = self.client.get(url, follow=True)
-        self.assertEqual(resp.status_code, 200)
+        self.assertNotContains(response, 'errors')
 
     def test_nas_admin_save_model(self):
         options = {
@@ -364,6 +325,8 @@ class TestAdmin(
     def test_radius_batch_save_model(self):
         self.assertEqual(RadiusBatch.objects.count(), 0)
         add_url = reverse(f'admin:{self.app_label}_radiusbatch_add')
+        response = self.client.get(add_url)
+        self.assertContains(response, 'flagged as verified if the organization')
         data = self._get_csv_post_data()
         response = self.client.post(add_url, data, follow=True)
         self.assertEqual(response.status_code, 200)
@@ -508,10 +471,18 @@ class TestAdmin(
         self.assertContains(response, 'error')
         self.assertContains(response, 'Cannot proceed with the delete')
 
+    def _assert_text_input(self, response, selector, value):
+        doc = lxml_html.fromstring(response.content.decode())
+        elements = doc.cssselect(selector)
+        self.assertEqual(len(elements), 1)
+        element = elements[0]
+        self.assertEqual(element.value.strip(), value)
+
     def test_organization_radsettings_freeradius_allowed_hosts(self):
         org = self._get_org()
         url = reverse(
-            f'admin:{self.app_label_users}_organization_change', args=[org.pk],
+            f'admin:{self.app_label_users}_organization_change',
+            args=[org.pk],
         )
         radsetting = OrganizationRadiusSettings.objects.get(organization=org)
         form_data = org.__dict__
@@ -530,8 +501,10 @@ class TestAdmin(
                 'radius_settings-0-sms_meta_data': 'null',
                 'radius_settings-0-id': radsetting.pk,
                 'radius_settings-0-organization': org.pk,
+                'radius_settings-0-password_reset_url': PASSWORD_RESET_URL,
             }
         )
+
         with self.subTest('Return FREERADIUS_ALLOWED_HOSTS back'):
             form_data.update(
                 {'radius_settings-0-freeradius_allowed_hosts': '127.0.0.1'}
@@ -541,7 +514,18 @@ class TestAdmin(
             radsetting.refresh_from_db()
             # This should fail when the value of FREERADIUS_ALLOWED_HOSTS is
             # stored in the model as well.
+            # Accessing "radsetting.freeradius_allowed_hosts" returns
+            # fallback value instead of "None". Calling "radsetting.clean()"
+            # resets the value only if the value is equal to the global default.
+            radsetting.clean()
             self.assertEqual(radsetting.freeradius_allowed_hosts, None)
+
+        with self.subTest('Ensure admin HTML shows the default value'):
+            response = self.client.get(url)
+            self._assert_text_input(
+                response, '#id_radius_settings-0-freeradius_allowed_hosts', '127.0.0.1'
+            )
+
         with self.subTest('Valid IP list'):
             form_data.update(
                 {'radius_settings-0-freeradius_allowed_hosts': '127.0.0.45'}
@@ -550,13 +534,9 @@ class TestAdmin(
             self.assertEqual(response.status_code, 302)
             radsetting.refresh_from_db()
             self.assertEqual(radsetting.freeradius_allowed_hosts, '127.0.0.45')
-        with self.subTest('Empty IP list with FREERADIUS_ALLOWED_HOSTS'):
-            form_data.update({'radius_settings-0-freeradius_allowed_hosts': ''})
-            response = self.client.post(url, form_data)
-            self.assertEqual(response.status_code, 302)
-            radsetting.refresh_from_db()
-            self.assertEqual(radsetting.freeradius_allowed_hosts, '')
+
         with self.subTest('Empty IP list without FREERADIUS_ALLOWED_HOSTS'):
+            form_data.update({'radius_settings-0-freeradius_allowed_hosts': ''})
             with mock.patch('openwisp_radius.settings.FREERADIUS_ALLOWED_HOSTS', []):
                 response = self.client.post(url, form_data)
             self.assertContains(
@@ -566,6 +546,7 @@ class TestAdmin(
                     '`OPENWISP_RADIUS_FREERADIUS_ALLOWED_HOSTS` is not provided.'
                 ),
             )
+
         with self.subTest('Invalid IP list'):
             form_data.update(
                 {'radius_settings-0-freeradius_allowed_hosts': '123.246.512.12'}
@@ -578,6 +559,105 @@ class TestAdmin(
                     'or subnets separated by comma. (no spaces)'
                 ),
             )
+
+    def test_organization_radsettings_password_reset_url(self):
+        org = self._get_org()
+        url = reverse(
+            f'admin:{self.app_label_users}_organization_change',
+            args=[org.pk],
+        )
+        radsetting = OrganizationRadiusSettings.objects.get(organization=org)
+        form_data = org.__dict__
+        form_data.update(
+            {
+                "owner-TOTAL_FORMS": "0",
+                "owner-INITIAL_FORMS": "0",
+                "owner-MIN_NUM_FORMS": "0",
+                "owner-MAX_NUM_FORMS": "1",
+                'radius_settings-TOTAL_FORMS': '1',
+                'radius_settings-INITIAL_FORMS': '1',
+                'radius_settings-MIN_NUM_FORMS': '0',
+                'radius_settings-MAX_NUM_FORMS': '1',
+                'radius_settings-0-token': '12345',
+                'radius_settings-0-sms_sender': '',
+                'radius_settings-0-sms_meta_data': 'null',
+                'radius_settings-0-id': radsetting.pk,
+                'radius_settings-0-organization': org.pk,
+                'radius_settings-0-password_reset_url': PASSWORD_RESET_URL,
+            }
+        )
+
+        with self.subTest(
+            'raise error if password_reset_url does not contain uid and token'
+        ):
+            pwd_reset_url = 'http://example.com/pwd/reset/'
+            form_data.update({'radius_settings-0-password_reset_url': pwd_reset_url})
+            response = self.client.post(url, form_data)
+            self.assertEqual(response.status_code, 200)
+            radsetting.refresh_from_db()
+            self.assertContains(response, 'The URL must contain the ')
+            self.assertContains(response, 'errors field-password_reset_url')
+
+        with self.subTest('Ensure admin HTML shows the default value'):
+            response = self.client.get(url)
+            self._assert_text_input(
+                response,
+                '#id_radius_settings-0-password_reset_url',
+                'http://localhost:8080/{organization}/password/'
+                'reset/confirm/{uid}/{token}',
+            )
+
+        with self.subTest('password_reset_url must be equal to fallback value'):
+            form_data.update(
+                {'radius_settings-0-password_reset_url': PASSWORD_RESET_URL}
+            )
+            response = self.client.post(url, form_data)
+            self.assertEqual(response.status_code, 302)
+            radsetting.refresh_from_db()
+            self.assertEqual(radsetting.password_reset_url, PASSWORD_RESET_URL)
+
+        with self.subTest('Test "site" placeholder does not break validation'):
+            with mock.patch.object(
+                app_settings,
+                'DEFAULT_PASSWORD_RESET_URL',
+                'https://{site}/{organization}/password/reset/confirm/{uid}/{token}',
+            ):
+                payload = form_data.copy()
+                payload.update(
+                    {
+                        'radius_settings-0-password_reset_url': (
+                            app_settings.DEFAULT_PASSWORD_RESET_URL
+                        ),
+                        '_continue': True,
+                    }
+                )
+                response = self.client.post(url, payload, follow=True)
+                self.assertEqual(response.status_code, 200)
+                self.assertNotContains(response, 'Enter a valid URL.')
+
+    def test_backward_compatible_default_password_reset_url(self):
+        # this test is only for backward compatible change
+        # it will be removed in the future
+        default_password_reset_url = (
+            'http://localhost:8081/{organization}/password/reset/confirm/{uid}/{token}'
+        )
+        url = reverse(
+            f'admin:{self.app_label_users}_organization_add',
+        )
+        PASSWORD_RESET_URLS = {'default': default_password_reset_url}
+        with mock.patch.object(
+            app_settings,
+            'DEFAULT_PASSWORD_RESET_URL',
+            app_settings.get_default_password_reset_url(PASSWORD_RESET_URLS),
+        ), mock.patch.object(
+            # The default value is set on project startup, hence
+            # it also requires mocking.
+            OrganizationRadiusSettings._meta.get_field('password_reset_url'),
+            'default',
+            app_settings.DEFAULT_PASSWORD_RESET_URL,
+        ):
+            response = self.client.get(url)
+            self.assertContains(response, default_password_reset_url)
 
     def test_radsettings_freeradius_allowed_hosts_help_text(self):
         url = reverse(f'admin:{self.app_label_users}_organization_add')
@@ -621,14 +701,22 @@ class TestAdmin(
     def _login(self, username='admin', password='tester'):
         self.client.force_login(User.objects.get(username=username))
 
-    def _get_url(self, url, user=False, group=False):
+    def _get_url(self, url, user=False, group=False, model_name=None):
         response = self.client.get(url)
+        autocomplete_url = f'/admin/autocomplete/?app_label={self.app_label}'
         user_url = f'/admin/{self.app_label_users}/user/autocomplete/'
         group_url = f'/admin/{self.app_label}/radiusgroup/autocomplete/'
+        if model_name:
+            autocomplete_url += f'&model_name={model_name}'
+        if user:
+            autocomplete_url += '&field_name=user'
+        if group:
+            autocomplete_url += '&field_name=group'
         if user_url in str(response.content) and user:
             return user_url
         if group_url in str(response.content) and group:
             return group_url
+        return autocomplete_url
 
     def test_radiusbatch_org_user(self):
         self.assertEqual(RadiusBatch.objects.count(), 0)
@@ -638,6 +726,14 @@ class TestAdmin(
         self.assertEqual(OrganizationUser.objects.all().count(), 3)
         for u in OrganizationUser.objects.all():
             self.assertEqual(u.organization, RadiusBatch.objects.first().organization)
+        # Test CSV URL in change form
+        rad_batch = RadiusBatch.objects.first()
+        response = self.client.get(
+            reverse(f'admin:{self.app_label}_radiusbatch_change', args=[rad_batch.id])
+        )
+        self.assertContains(
+            response, reverse('radius:serve_private_file', args=[rad_batch.csvfile])
+        )
 
     def _create_multitenancy_test_env(
         self, usergroup=False, groupcheck=False, groupreply=False
@@ -648,6 +744,7 @@ class TestAdmin(
             **{'name': 'inactive org', 'is_active': False, 'slug': 'inactive-org'}
         )
         operator = TestMultitenantAdminMixin()._create_operator()
+        administrator = self._create_administrator([org1, inactive])
         self._create_org_user(organization=org1, user=operator, is_admin=True)
         self._create_org_user(organization=inactive, user=operator, is_admin=True)
         user11 = User.objects.create(
@@ -777,6 +874,7 @@ class TestAdmin(
             user22=user22,
             user33=user33,
             operator=operator,
+            administrator=administrator,
         )
         if usergroup:
             ug1 = self._create_radius_usergroup(user=user11, group=rg1)
@@ -815,13 +913,15 @@ class TestAdmin(
             hidden=[data['rc2'].username, data['org2'].name, data['rc3'].username],
         )
 
-    def test_radiuscheck_organization_fk_queryset(self):
+    def test_radiuscheck_organization_fk_autocomplete_view(self):
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
-            url=reverse(f'admin:{self.app_label}_radiuscheck_add'),
+            url=self._get_autocomplete_view_path(
+                self.app_label, 'radiuscheck', 'organization'
+            ),
             visible=[data['org1'].name],
             hidden=[data['org2'].name, data['inactive']],
-            select_widget=True,
+            administrator=True,
         )
 
     @capture_any_output()
@@ -829,10 +929,13 @@ class TestAdmin(
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
             url=self._get_url(
-                reverse(f'admin:{self.app_label}_radiuscheck_add'), user=True
+                reverse(f'admin:{self.app_label}_radiuscheck_add'),
+                user=True,
+                model_name='radiuscheck',
             ),
             visible=[data['user11']],
             hidden=[data['user22']],
+            administrator=True,
         )
 
     def test_radiusreply_queryset(self):
@@ -843,13 +946,15 @@ class TestAdmin(
             hidden=[data['rr2'].username, data['org2'], data['rr3'].username],
         )
 
-    def test_radiusreply_organization_fk_queryset(self):
+    def test_radiusreply_organization_fk_autocomplete_view(self):
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
-            url=reverse(f'admin:{self.app_label}_radiusreply_add'),
+            url=self._get_autocomplete_view_path(
+                self.app_label, 'radiusreply', 'organization'
+            ),
             visible=[data['org1'].name],
             hidden=[data['org2'].name, data['inactive']],
-            select_widget=True,
+            administrator=True,
         )
 
     @capture_any_output()
@@ -857,10 +962,13 @@ class TestAdmin(
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
             url=self._get_url(
-                reverse(f'admin:{self.app_label}_radiusreply_add'), user=True
+                reverse(f'admin:{self.app_label}_radiusreply_add'),
+                user=True,
+                model_name='radiusreply',
             ),
             visible=[data['user11']],
             hidden=[data['user22']],
+            administrator=True,
         )
 
     def test_radiusgroup_queryset(self):
@@ -871,13 +979,15 @@ class TestAdmin(
             hidden=[data['org2'].name, data['rg2'].name, data['rg3'].name],
         )
 
-    def test_radiusgroup_organization_fk_queryset(self):
+    def test_radiusgroup_organization_fk_autocomplete_view(self):
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
-            url=(reverse(f'admin:{self.app_label}_radiusgroup_add')),
+            url=self._get_autocomplete_view_path(
+                self.app_label, 'radiusgroup', 'organization'
+            ),
             visible=[data['org1'].name],
             hidden=[data['org2'].name, data['inactive']],
-            select_widget=True,
+            administrator=True,
         )
 
     def test_nas_queryset(self):
@@ -888,13 +998,13 @@ class TestAdmin(
             hidden=[data['nas2'].name, data['org2'].name, data['nas3'].name],
         )
 
-    def test_nas_organization_fk_queryset(self):
+    def test_nas_organization_fk_autocomplete_view(self):
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
-            url=reverse(f'admin:{self.app_label}_nas_add'),
+            url=self._get_autocomplete_view_path(self.app_label, 'nas', 'organization'),
             visible=[data['org1'].name],
             hidden=[data['org2'].name, data['inactive']],
-            select_widget=True,
+            administrator=True,
         )
 
     def test_radiusaccounting_queryset(self):
@@ -913,13 +1023,31 @@ class TestAdmin(
             hidden=[data['rb2'].name, data['org2'].name, data['rb3'].name],
         )
 
-    def test_radiusbatch_organization_fk_queryset(self):
+    def test_radiusbatch_organization_fk_autocomplete_view(self):
         data = self._create_multitenancy_test_env()
         self._test_multitenant_admin(
-            url=reverse(f'admin:{self.app_label}_radiusbatch_add'),
+            url=self._get_autocomplete_view_path(
+                self.app_label, 'radiusbatch', 'organization'
+            ),
             visible=[data['org1'].name],
             hidden=[data['org2'].name, data['inactive']],
-            select_widget=True,
+            administrator=True,
+        )
+
+    def test_non_existing_radiusbatch_change_view(self):
+        id = '00000000-0000-0000-0000-0000000000000'
+        response = self.client.post(
+            reverse(f'admin:{self.app_label}_radiusbatch_change', args=[id]),
+            follow=True,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(
+            response,
+            (
+                f'Batch user creation with ID “{id}” doesn’t exist.'
+                ' Perhaps it was deleted?'
+            ),
+            html=True,
         )
 
     def test_radius_usergroup_queryset(self):
@@ -934,7 +1062,9 @@ class TestAdmin(
         data = self._create_multitenancy_test_env(usergroup=True)
         self._test_multitenant_admin(
             url=self._get_url(
-                reverse(f'admin:{self.app_label}_radiususergroup_add'), group=True,
+                reverse(f'admin:{self.app_label}_radiususergroup_add'),
+                group=True,
+                model_name='radiususergroup',
             ),
             visible=[data['rg1']],
             hidden=[data['rg2']],
@@ -945,10 +1075,13 @@ class TestAdmin(
         data = self._create_multitenancy_test_env(usergroup=True)
         self._test_multitenant_admin(
             url=self._get_url(
-                reverse(f'admin:{self.app_label}_radiususergroup_add'), user=True,
+                reverse(f'admin:{self.app_label}_radiususergroup_add'),
+                user=True,
+                model_name='radiususergroup',
             ),
             visible=[data['user11']],
             hidden=[data['user22']],
+            administrator=True,
         )
 
     def test_radius_groupcheck_queryset(self):
@@ -963,7 +1096,9 @@ class TestAdmin(
         data = self._create_multitenancy_test_env(groupcheck=True)
         self._test_multitenant_admin(
             url=self._get_url(
-                reverse(f'admin:{self.app_label}_radiusgroupcheck_add'), group=True,
+                reverse(f'admin:{self.app_label}_radiusgroupcheck_add'),
+                group=True,
+                model_name='radiusgroupcheck',
             ),
             visible=[data['rg1']],
             hidden=[data['rg2']],
@@ -981,21 +1116,24 @@ class TestAdmin(
         data = self._create_multitenancy_test_env(groupreply=True)
         self._test_multitenant_admin(
             url=self._get_url(
-                reverse(f'admin:{self.app_label}_radiusgroupreply_add'), group=True,
+                reverse(f'admin:{self.app_label}_radiusgroupreply_add'),
+                group=True,
+                model_name='radiusgroupreply',
             ),
             visible=[data['rg1']],
             hidden=[data['rg2']],
         )
 
     @capture_any_output()
-    def test_radiustoken_delete_queryset(self):
+    def test_radiustoken_delete_queryset(self, *args, **kwargs):
         # Create & check radius token works
         self._get_org_user()
         radtoken, _ = RadiusToken.objects.get_or_create(
             user=self._get_user(), organization=self._get_org(), can_auth=True
         )
         response = self.client.post(
-            reverse('radius:authorize'), {'username': 'tester', 'password': 'tester'},
+            reverse('radius:authorize'),
+            {'username': 'tester', 'password': 'tester'},
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(cache.get('rt-tester'), str(self.default_org.pk))
@@ -1012,7 +1150,8 @@ class TestAdmin(
         self.assertEqual(response.status_code, 200)
         # Test delete queryset deleted cache
         response = self.client.post(
-            reverse('radius:authorize'), {'username': 'tester', 'password': 'tester'},
+            reverse('radius:authorize'),
+            {'username': 'tester', 'password': 'tester'},
         )
         self.assertEqual(response.status_code, 403)
         self.assertEqual(cache.get('rt-tester'), None)
@@ -1020,7 +1159,8 @@ class TestAdmin(
     def test_organization_radsettings_allowed_mobile_prefixes(self):
         org = self._get_org()
         url = reverse(
-            f'admin:{self.app_label_users}_organization_change', args=[org.pk],
+            f'admin:{self.app_label_users}_organization_change',
+            args=[org.pk],
         )
         radsetting = OrganizationRadiusSettings.objects.get(organization=org)
         form_data = org.__dict__
@@ -1039,14 +1179,25 @@ class TestAdmin(
                 'radius_settings-0-sms_meta_data': 'null',
                 'radius_settings-0-id': radsetting.pk,
                 'radius_settings-0-organization': org.pk,
+                'radius_settings-0-password_reset_url': PASSWORD_RESET_URL,
             }
         )
+
+        with self.subTest('Ensure admin HTML shows the default value'):
+            response = self.client.get(url)
+            self._assert_text_input(
+                response,
+                '#id_radius_settings-0-allowed_mobile_prefixes',
+                '+44,+39,+237,+595',
+            )
+
         with self.subTest('Valid mobile prefix list'):
             form_data.update({'radius_settings-0-allowed_mobile_prefixes': '+51,+44'})
             response = self.client.post(url, form_data)
             self.assertEqual(response.status_code, 302)
             radsetting.refresh_from_db()
             self.assertEqual(radsetting.allowed_mobile_prefixes, '+51,+44')
+
         with self.subTest('Invalid list'):
             form_data.update({'radius_settings-0-allowed_mobile_prefixes': '+51, +44'})
             response = self.client.post(url, form_data)
@@ -1080,6 +1231,77 @@ class TestAdmin(
                     'Invalid input. Please enter valid mobile '
                     'prefixes separated by comma. (no spaces)'
                 ),
+            )
+
+    def test_organization_radsettings_sms_message(self):
+        org = self._get_org()
+        url = reverse(
+            f'admin:{self.app_label_users}_organization_change',
+            args=[org.pk],
+        )
+        radsetting = OrganizationRadiusSettings.objects.get(organization=org)
+        form_data = org.__dict__
+        form_data.update(
+            {
+                "owner-TOTAL_FORMS": "0",
+                "owner-INITIAL_FORMS": "0",
+                "owner-MIN_NUM_FORMS": "0",
+                "owner-MAX_NUM_FORMS": "1",
+                'radius_settings-TOTAL_FORMS': '1',
+                'radius_settings-INITIAL_FORMS': '1',
+                'radius_settings-MIN_NUM_FORMS': '0',
+                'radius_settings-MAX_NUM_FORMS': '1',
+                'radius_settings-0-token': '12345',
+                'radius_settings-0-sms_sender': '',
+                'radius_settings-0-sms_meta_data': 'null',
+                'radius_settings-0-id': radsetting.pk,
+                'radius_settings-0-organization': org.pk,
+                'radius_settings-0-password_reset_url': PASSWORD_RESET_URL,
+                '_continue': True,
+            }
+        )
+
+        with self.subTest('raise error if sms_message does not contain code'):
+            sms_message = 'Verification code for {organization}'
+            form_data.update({'radius_settings-0-sms_message': sms_message})
+            response = self.client.post(url, form_data, follow=True)
+            self.assertEqual(response.status_code, 200)
+            radsetting.refresh_from_db()
+            self.assertContains(
+                response,
+                'The SMS message must contain the "{code}" placeholder,'
+                ' eg: {organization} verification code: {code}.',
+                html=True,
+            )
+            self.assertContains(response, 'errors field-sms_message')
+
+        with self.subTest('Ensure admin HTML shows the default value'):
+            response = self.client.get(url)
+            self._assert_text_input(
+                response,
+                '#id_radius_settings-0-sms_message',
+                app_settings.SMS_MESSAGE_TEMPLATE,
+            )
+
+        with self.subTest('sms_message must be equal to fallback value'):
+            form_data.update(
+                {'radius_settings-0-sms_message': app_settings.SMS_MESSAGE_TEMPLATE}
+            )
+            response = self.client.post(url, form_data, follow=True)
+            self.assertEqual(response.status_code, 200)
+            radsetting.refresh_from_db()
+            self.assertEqual(radsetting.sms_message, app_settings.SMS_MESSAGE_TEMPLATE)
+
+        with self.subTest('sms_message fallbacks to default when empty'):
+            form_data.update({'radius_settings-0-sms_message': ''})
+            response = self.client.post(url, form_data, follow=True)
+            self.assertEqual(response.status_code, 200)
+            radsetting.refresh_from_db()
+            self.assertEqual(radsetting.sms_message, app_settings.SMS_MESSAGE_TEMPLATE)
+            self._assert_text_input(
+                response,
+                '#id_radius_settings-0-sms_message',
+                app_settings.SMS_MESSAGE_TEMPLATE,
             )
 
     def test_inline_registered_user(self):

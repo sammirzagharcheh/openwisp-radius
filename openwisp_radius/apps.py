@@ -1,4 +1,6 @@
 import swapper
+from allauth.account.apps import AccountConfig
+from allauth.socialaccount.apps import SocialAccountConfig
 from django.contrib.auth import get_user_model
 from django.db.models.signals import post_delete, post_save, pre_save
 from django.utils.translation import gettext_lazy as _
@@ -10,13 +12,17 @@ from openwisp_utils.utils import default_or_test
 
 from . import settings as app_settings
 from .receivers import (
+    close_previous_radius_accounting_sessions,
     convert_radius_called_station_id,
     create_default_groups_handler,
     organization_post_save,
     organization_pre_save,
+    radius_user_group_change,
+    send_email_on_new_accounting_handler,
     set_default_group_handler,
 )
 from .registration import register_registration_method
+from .signals import radius_accounting_success
 from .utils import load_model, update_user_related_records
 
 
@@ -40,15 +46,19 @@ class OpenwispRadiusConfig(ApiAppConfig):
             'others': default_or_test('400/hour', None),
         },
     }
+    AccountConfig.default_auto_field = 'django.db.models.AutoField'
+    SocialAccountConfig.default_auto_field = 'django.db.models.AutoField'
 
     def ready(self, *args, **kwargs):
+        from . import checks  # noqa
+
         super().ready(*args, **kwargs)
         self.connect_signals()
         self.regiser_menu_groups()
 
-        if app_settings.SOCIAL_LOGIN_ENABLED:
+        if app_settings.SOCIAL_REGISTRATION_CONFIGURED:
             register_registration_method('social_login', _('Social login'))
-        if app_settings.SAML_LOGIN_ENABLED:
+        if app_settings.SAML_REGISTRATION_CONFIGURED:
             register_registration_method(
                 'saml',
                 app_settings.SAML_REGISTRATION_METHOD_LABEL,
@@ -61,7 +71,15 @@ class OpenwispRadiusConfig(ApiAppConfig):
         OrganizationRadiusSettings = load_model('OrganizationRadiusSettings')
         RadiusToken = load_model('RadiusToken')
         RadiusAccounting = load_model('RadiusAccounting')
+        RadiusUserGroup = load_model('RadiusUserGroup')
         User = get_user_model()
+        from openwisp_radius.api.freeradius_views import AccountingView
+
+        radius_accounting_success.connect(
+            send_email_on_new_accounting_handler,
+            sender=AccountingView,
+            dispatch_uid='send_email_on_new_accounting',
+        )
 
         post_save.connect(
             create_default_groups_handler,
@@ -102,6 +120,16 @@ class OpenwispRadiusConfig(ApiAppConfig):
             self.radiusorgsettings_post_delete,
             sender=OrganizationRadiusSettings,
             dispatch_uid='openwisp_radius_organizationradiussettings_post_delete',
+        )
+        post_save.connect(
+            close_previous_radius_accounting_sessions,
+            sender=RadiusAccounting,
+            dispatch_uid='openwisp_radius_close_previous_radius_accounting_sessions',
+        )
+        pre_save.connect(
+            radius_user_group_change,
+            sender=RadiusUserGroup,
+            dispatch_uid='radius_user_group_change_coa',
         )
         if app_settings.CONVERT_CALLED_STATION_ON_CREATE:
             post_save.connect(

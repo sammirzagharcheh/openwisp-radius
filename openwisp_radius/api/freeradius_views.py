@@ -13,7 +13,12 @@ from django_filters.rest_framework import DjangoFilterBackend
 from drf_yasg.utils import swagger_auto_schema
 from ipware import get_client_ip
 from rest_framework.authentication import BaseAuthentication
-from rest_framework.exceptions import AuthenticationFailed, NotAuthenticated, ParseError
+from rest_framework.exceptions import (
+    AuthenticationFailed,
+    NotAuthenticated,
+    ParseError,
+    ValidationError,
+)
 from rest_framework.generics import CreateAPIView, GenericAPIView, ListCreateAPIView
 from rest_framework.response import Response
 
@@ -23,6 +28,7 @@ from .. import registration
 from .. import settings as app_settings
 from ..counters.base import BaseCounter
 from ..counters.exceptions import MaxQuotaReached, SkipCheck
+from ..signals import radius_accounting_success
 from ..utils import load_model
 from .serializers import (
     AuthorizeSerializer,
@@ -253,6 +259,8 @@ class AuthorizeView(GenericAPIView, IDVerificationHelper):
 
             for counter in app_settings.COUNTERS:
                 group_check = group_checks.get(counter.check_name)
+                if not group_check:
+                    continue
                 try:
                     remaining = counter(
                         user=user, group=user_group.group, group_check=group_check
@@ -399,7 +407,7 @@ class AccountingView(ListCreateAPIView):
     serializer_class = RadiusAccountingSerializer
     pagination_class = AccountingViewPagination
     filter_backends = (DjangoFilterBackend,)
-    filter_class = AccountingFilter
+    filterset_class = AccountingFilter
 
     def get_queryset(self):
         return super().get_queryset().filter(organization_id=self.request.auth)
@@ -427,23 +435,58 @@ class AccountingView(ListCreateAPIView):
             instance = self.get_queryset().get(unique_id=data.get('unique_id'))
         except RadiusAccounting.DoesNotExist:
             serializer = self.get_serializer(data=data)
-            serializer.is_valid(raise_exception=True)
+            try:
+                serializer.is_valid(raise_exception=True)
+            except ValidationError as error:
+                if self._is_interim_update_corner_case(error, data):
+                    return Response(None)
+                raise error
             acct_data = self._data_to_acct_model(serializer.validated_data.copy())
             serializer.create(acct_data)
             headers = self.get_success_headers(serializer.data)
+            self.send_radius_accounting_signal(serializer.validated_data)
             return Response(None, status=201, headers=headers)
         else:
             serializer = self.get_serializer(instance, data=data, partial=False)
             serializer.is_valid(raise_exception=True)
             acct_data = self._data_to_acct_model(serializer.validated_data.copy())
             serializer.update(instance, acct_data)
+            self.send_radius_accounting_signal(serializer.validated_data)
             return Response(None)
+
+    def _is_interim_update_corner_case(self, error, data):
+        """
+        Handles "Interim-Updates" for RadiusAccounting sessions
+        that are closed by OpenWISP when user logs into
+        another organization.
+        """
+        unique_id_errors = error.detail.get('unique_id', [])
+        if len(unique_id_errors) == 1:
+            error_detail = unique_id_errors.pop()
+            if (
+                str(error_detail)
+                == 'accounting with this accounting unique ID already exists.'
+                and error_detail.code == 'unique'
+            ):
+                rad = RadiusAccounting.objects.only('organization_id').get(
+                    unique_id=data.get('unique_id')
+                )
+                if rad.organization_id != self.request.auth:
+                    return True
+        return False
 
     def _data_to_acct_model(self, valid_data):
         acct_org = Organization.objects.get(pk=self.request.auth)
         valid_data.pop('status_type', None)
         valid_data['organization'] = acct_org
         return valid_data
+
+    def send_radius_accounting_signal(self, accounting_data):
+        radius_accounting_success.send(
+            sender=self.__class__,
+            accounting_data=accounting_data,
+            view=self,
+        )
 
 
 accounting = AccountingView.as_view()

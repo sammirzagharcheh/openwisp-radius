@@ -35,7 +35,10 @@ class Migration(migrations.Migration):
     ]
 
     operations = [
-        migrations.RemoveField(model_name='radiusaccounting', name='id',),
+        migrations.RemoveField(
+            model_name='radiusaccounting',
+            name='id',
+        ),
         migrations.AddField(
             model_name='nas',
             name='details',
@@ -123,11 +126,6 @@ class Migration(migrations.Migration):
             model_name='radiuscheck',
             name='is_active',
             field=models.BooleanField(default=True),
-        ),
-        migrations.AddField(
-            model_name='radiuscheck',
-            name='notes',
-            field=models.TextField(blank=True, null=True),
         ),
         migrations.AddField(
             model_name='radiuscheck',
@@ -521,12 +519,14 @@ class Migration(migrations.Migration):
                 (
                     'sms_verification',
                     models.BooleanField(
-                        default=False,
+                        blank=True,
+                        default=None,
                         help_text=(
                             'whether users who sign up should be '
                             'required to verify their mobile '
                             'phone number via SMS'
                         ),
+                        null=True,
                     ),
                 ),
                 (
@@ -612,7 +612,8 @@ class Migration(migrations.Migration):
             ),
         ),
         migrations.AlterUniqueTogether(
-            name='radiususergroup', unique_together={('user', 'group')},
+            name='radiususergroup',
+            unique_together={('user', 'group')},
         ),
         migrations.CreateModel(
             name='RadiusBatch',

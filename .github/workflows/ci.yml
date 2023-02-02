@@ -12,18 +12,21 @@ on:
 jobs:
   build:
     name: Python==${{ matrix.python-version }} | ${{ matrix.django-version }}
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-22.04
 
     strategy:
       fail-fast: false
       matrix:
         python-version:
-          - 3.7
-          - 3.8
-          - 3.9
+          - "3.8"
+          - "3.9"
+          - "3.10"
         django-version:
-          - django~=3.0.0
-          - django~=3.1.0
+          - django~=3.2.0
+          - django~=4.0.0
+        include:
+          - django-version: django~=3.2.0
+            python-version: 3.7
 
     steps:
       - uses: actions/checkout@v2
@@ -33,7 +36,7 @@ jobs:
       - name: Install system libraries
         run: |
           sudo apt update
-          sudo apt-get -qq -y install xmlsec1
+          sudo apt-get -qq -y install xmlsec1 gettext
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v2
@@ -43,14 +46,15 @@ jobs:
       - name: Install python dependencies
         run: |
           pip install -U pip wheel setuptools
-          pip install ${{ matrix.django-version }}
           pip install -U -r requirements-test.txt
 
       - name: Install npm dependencies
         run: sudo npm install -g jslint
 
       - name: Install openwisp-radius
-        run: pip install -e .[saml,openvpn_status]
+        run: |
+          pip install -e .[saml,openvpn_status]
+          pip install ${{ matrix.django-version }}
 
       - name: QA checks
         run: |
@@ -67,7 +71,7 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COVERALLS_FLAG_NAME: |
-           python-${{ matrix.python-version }}-${{ matrix.django-version }}
+            python-${{ matrix.python-version }}-${{ matrix.django-version }}
           COVERALLS_PARALLEL: true
 
   coveralls:

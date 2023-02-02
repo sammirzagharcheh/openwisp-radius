@@ -5,6 +5,7 @@ from unittest import mock
 import swapper
 from dateutil import parser
 from django.contrib.auth import get_user_model
+from django.core.cache import cache
 from django.urls import reverse
 from freezegun import freeze_time
 from rest_framework.authtoken.models import Token
@@ -192,11 +193,15 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         phone_token = PhoneToken.objects.filter(user=user).last()
         # generate entropy to ensure correct token is used
         PhoneToken.objects.create(
-            user=user, ip=phone_token.ip, phone_number=phone_token.phone_number,
+            user=user,
+            ip=phone_token.ip,
+            phone_number=phone_token.phone_number,
         )
         phone_token = PhoneToken.objects.create(
             user=user, ip=phone_token.ip, phone_number=phone_token.phone_number
         )
+        cache_key = f'rt-{phone_token.phone_number}'
+        cache.set(cache_key, 'test')
         self.assertEqual(phone_token.attempts, 0)
         url = reverse('radius:phone_token_validate', args=[self.default_org.slug])
         r = self.client.post(
@@ -213,6 +218,7 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         self.assertTrue(user.registered_user.is_verified)
         self.assertEqual(user.registered_user.modified, parser.parse(_TEST_DATE))
         self.assertEqual(user.registered_user.method, 'mobile_phone')
+        self.assertIsNone(cache.get(cache_key))
 
     @capture_any_output()
     def test_validate_phone_token_400_not_member(self):
@@ -233,7 +239,9 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         self.assertEqual(phone_token.attempts, 0)
         url = reverse('radius:phone_token_validate', args=[self.default_org.slug])
         r = self.client.post(
-            url, {'code': '123456'}, HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
+            url,
+            {'code': '123456'},
+            HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
         )
         self.assertEqual(r.status_code, 400)
         user.refresh_from_db()
@@ -278,7 +286,9 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         max_value = app_settings.SMS_TOKEN_MAX_ATTEMPTS + 1
         for n in range(1, max_value + 2):
             r = self.client.post(
-                url, {'code': '123456'}, HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
+                url,
+                {'code': '123456'},
+                HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
             )
             self.assertEqual(r.status_code, 400)
             phone_token.refresh_from_db()
@@ -324,7 +334,9 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         self.assertEqual(PhoneToken.objects.count(), 0)
         url = reverse('radius:phone_token_validate', args=[self.default_org.slug])
         r = self.client.post(
-            url, {'code': '123456'}, HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
+            url,
+            {'code': '123456'},
+            HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
         )
         self.assertEqual(r.status_code, 400)
         self.assertIn('non_field_errors', r.data)
@@ -446,7 +458,6 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         self.assertIn('required', str(r.data['phone_number']))
 
     def test_phone_number_restriction_in_signup(self):
-        app_settings.ALLOWED_MOBILE_PREFIXES = ['+33']
         self.assertEqual(User.objects.all().count(), 0)
         user_param = {
             'username': 'test',
@@ -459,13 +470,17 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         msg = 'This international mobile prefix is not allowed.'
 
         with self.subTest('test create user with number allowed at global level'):
-            user_param.update({'phone_number': '+33675579231'})
+            user_param.update({'phone_number': '+393664255803'})
             r = self.client.post(url, user_param)
             self.assertEqual(r.status_code, 201)
             self.assertEqual(User.objects.all().count(), 1)
             self.assertIn('key', r.data)
 
         with self.subTest('test create user with number not allowed at org level'):
+            radius_settings = self.default_org.radius_settings
+            radius_settings.allowed_mobile_prefixes = '+1'
+            radius_settings.full_clean()
+            radius_settings.save()
             user_param.update(
                 {
                     'email': 'test1@email.com',
@@ -480,14 +495,14 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
 
         with self.subTest('test create user with number allowed at org level'):
             radius_settings = self.default_org.radius_settings
-            radius_settings.allowed_mobile_prefixes = '+1,+44'
+            radius_settings.allowed_mobile_prefixes = '+1'
             radius_settings.full_clean()
             radius_settings.save()
             user_param.update(
                 {
                     'email': 'test1@email.com',
                     'username': 'test1',
-                    'phone_number': '+44 7795 106991',
+                    'phone_number': '+1 7795 106991',
                 }
             )
             r = self.client.post(url, user_param)
@@ -495,12 +510,12 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
             self.assertEqual(User.objects.all().count(), 2)
             self.assertIn('key', r.data)
 
-        with self.subTest('test create user with number not allowed'):
+        with self.subTest('test create user with number not allowed at global level'):
             user_param.update(
                 {
                     'email': 'test2@email.com',
                     'username': 'test2',
-                    'phone_number': '+237675752913',
+                    'phone_number': '+34 985 959423',
                 }
             )
             r = self.client.post(url, user_param)
@@ -508,12 +523,9 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
             self.assertIn(msg, str(r.data['phone_number']))
             self.assertEqual(User.objects.all().count(), 2)
 
-        app_settings.ALLOWED_MOBILE_PREFIXES = []
-
     @capture_any_output()
     def test_change_phone_number_restriction(self):
         self._register_user()
-        app_settings.ALLOWED_MOBILE_PREFIXES = ['+33']
         user = User.objects.get(email=self._test_email)
         user_token = Token.objects.filter(user=user).last()
         phone_token_qs = PhoneToken.objects.filter(user=user)
@@ -525,7 +537,7 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
         with self.subTest('test change number not allowed at global level'):
             r = self.client.post(
                 url,
-                json.dumps({'phone_number': '+237675579231'}),
+                json.dumps({'phone_number': '+34 985 959423'}),
                 content_type='application/json',
                 HTTP_AUTHORIZATION=f'Bearer {user_token.key}',
             )
@@ -534,7 +546,7 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
             self.assertEqual(phone_token_qs.count(), 0)
 
         with self.subTest('test change number allowed at global level'):
-            phone_number = '+33675579245'
+            phone_number = '+393664255803'
             r = self.client.post(
                 url,
                 json.dumps({'phone_number': phone_number}),
@@ -555,6 +567,10 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
             self.assertEqual(user.phone_number, phone_number)
 
         with self.subTest('test change number not allowed at org level'):
+            radius_settings = self.default_org.radius_settings
+            radius_settings.allowed_mobile_prefixes = '+1'
+            radius_settings.full_clean()
+            radius_settings.save()
             r = self.client.post(
                 url,
                 json.dumps({'phone_number': '+44 7795 106991'}),
@@ -569,10 +585,10 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
             user.registered_user.is_verified = False
             user.registered_user.save()
             radius_settings = self.default_org.radius_settings
-            radius_settings.allowed_mobile_prefixes = '+1,+44'
+            radius_settings.allowed_mobile_prefixes = '+1'
             radius_settings.full_clean()
             radius_settings.save()
-            phone_number = '+44 7795 106991'
+            phone_number = '+1 7795 106991'
             r = self.client.post(
                 url,
                 json.dumps({'phone_number': phone_number}),
@@ -591,8 +607,6 @@ class TestPhoneVerification(ApiTokenMixin, BaseTestCase):
             self.assertEqual(r.status_code, 200)
             user.refresh_from_db()
             self.assertEqual(user.phone_number, phone_number)
-
-        app_settings.ALLOWED_MOBILE_PREFIXES = []
 
     def _test_change_phone_number_sms_on_helper(self, is_active):
         self._register_user()

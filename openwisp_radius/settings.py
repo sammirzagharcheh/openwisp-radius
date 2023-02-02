@@ -25,13 +25,23 @@ def get_settings_value(option, default):
     return getattr(settings, f'OPENWISP_RADIUS_{option}', default)
 
 
+def get_default_password_reset_url(urls):
+    # default is kept for backward compatibility,
+    # will be removed in future versions
+    return urls.get('default') or urls.get('__all__')
+
+
 RADIUS_API = get_settings_value('API', True)
 RADIUS_API_BASEURL = get_settings_value('API_BASEURL', '/')
+RADIUS_API_URLCONF = get_settings_value('API_URLCONF', None)
 EDITABLE_ACCOUNTING = get_settings_value('EDITABLE_ACCOUNTING', False)
 EDITABLE_POSTAUTH = get_settings_value('EDITABLE_POSTAUTH', False)
 GROUPCHECK_ADMIN = get_settings_value('GROUPCHECK_ADMIN', False)
 GROUPREPLY_ADMIN = get_settings_value('GROUPREPLY_ADMIN', False)
 USERGROUP_ADMIN = get_settings_value('USERGROUP_ADMIN', False)
+USER_ADMIN_RADIUSTOKEN_INLINE = get_settings_value(
+    'USER_ADMIN_RADIUSTOKEN_INLINE', False
+)
 DEFAULT_SECRET_FORMAT = get_settings_value('DEFAULT_SECRET_FORMAT', 'NT-Password')
 DISABLED_SECRET_FORMATS = get_settings_value('DISABLED_SECRET_FORMATS', [])
 BATCH_DEFAULT_PASSWORD_LENGTH = get_settings_value('BATCH_DEFAULT_PASSWORD_LENGTH', 8)
@@ -39,12 +49,19 @@ BATCH_DELETE_EXPIRED = get_settings_value('BATCH_DELETE_EXPIRED', 18)
 BATCH_MAIL_SUBJECT = get_settings_value('BATCH_MAIL_SUBJECT', 'Credentials')
 BATCH_MAIL_SENDER = get_settings_value('BATCH_MAIL_SENDER', settings.DEFAULT_FROM_EMAIL)
 API_AUTHORIZE_REJECT = get_settings_value('API_AUTHORIZE_REJECT', False)
-SOCIAL_LOGIN_ENABLED = 'allauth.socialaccount' in settings.INSTALLED_APPS
-SAML_LOGIN_ENABLED = 'djangosaml2' in settings.INSTALLED_APPS
+SOCIAL_REGISTRATION_CONFIGURED = 'allauth.socialaccount' in getattr(
+    settings, 'INSTALLED_APPS', []
+)
+SOCIAL_REGISTRATION_ENABLED = get_settings_value('SOCIAL_REGISTRATION_ENABLED', False)
+SAML_REGISTRATION_CONFIGURED = 'djangosaml2' in getattr(settings, 'INSTALLED_APPS', [])
+SAML_REGISTRATION_ENABLED = get_settings_value('SAML_REGISTRATION_ENABLED', False)
 SAML_REGISTRATION_METHOD_LABEL = get_settings_value(
     'SAML_REGISTRATION_METHOD_LABEL', _('Single Sign-On (SAML)')
 )
 SAML_IS_VERIFIED = get_settings_value('SAML_IS_VERIFIED', False)
+SAML_UPDATES_PRE_EXISTING_USERNAME = get_settings_value(
+    'SAML_UPDATES_PRE_EXISTING_USERNAME', False
+)
 DISPOSABLE_RADIUS_USER_TOKEN = get_settings_value('DISPOSABLE_RADIUS_USER_TOKEN', True)
 API_ACCOUNTING_AUTO_GROUP = get_settings_value('API_ACCOUNTING_AUTO_GROUP', True)
 FREERADIUS_ALLOWED_HOSTS = get_settings_value('FREERADIUS_ALLOWED_HOSTS', [])
@@ -59,23 +76,15 @@ BATCH_PDF_TEMPLATE = get_settings_value(
 BATCH_MAIL_MESSAGE = get_settings_value(
     'BATCH_MAIL_MESSAGE', 'username: {}, password: {}'
 )
-RADCHECK_SECRET_VALIDATORS = get_settings_value(
-    'RADCHECK_SECRET_VALIDATORS',
-    {
-        'regexp_lowercase': '[a-z]+',
-        'regexp_uppercase': '[A-Z]+',
-        'regexp_number': '[0-9]+',
-        'regexp_special': '[\!\%\-_+=\[\]\
-                          {\}\:\,\.\?\<\>\(\)\;]+',
-    },
-)
 PASSWORD_RESET_URLS = {
     # fallback in case the specific org page is not defined
-    'default': 'https://{site}/{organization}/password/reset/confirm/{uid}/{token}',
+    '__all__': 'https://{site}/{organization}/password/reset/confirm/{uid}/{token}',
     # use the uuid because the slug can change
 }
 PASSWORD_RESET_URLS.update(get_settings_value('PASSWORD_RESET_URLS', {}))
-SMS_DEFAULT_VERIFICATION = get_settings_value('SMS_DEFAULT_VERIFICATION', False)
+DEFAULT_PASSWORD_RESET_URL = get_default_password_reset_url(PASSWORD_RESET_URLS)
+SMS_VERIFICATION_ENABLED = get_settings_value('SMS_VERIFICATION_ENABLED', False)
+COA_ENABLED = get_settings_value('COA_ENABLED', False)
 # SMS_TOKEN_DEFAULT_VALIDITY time is in minutes
 SMS_TOKEN_DEFAULT_VALIDITY = get_settings_value('SMS_TOKEN_DEFAULT_VALIDITY', 30)
 SMS_TOKEN_LENGTH = get_settings_value('SMS_TOKEN_LENGTH', 6)
@@ -87,6 +96,9 @@ SMS_TOKEN_MAX_IP_DAILY = get_settings_value('SMS_TOKEN_MAX_IP_DAILY', 999)
 ALLOWED_MOBILE_PREFIXES = get_settings_value('ALLOWED_MOBILE_PREFIXES', [])
 REGISTRATION_API_ENABLED = get_settings_value('REGISTRATION_API_ENABLED', True)
 NEEDS_IDENTITY_VERIFICATION = get_settings_value('NEEDS_IDENTITY_VERIFICATION', False)
+SMS_MESSAGE_TEMPLATE = get_settings_value(
+    'SMS_MESSAGE_TEMPLATE', '{organization} verification code: {code}'
+)
 OPTIONAL_REGISTRATION_FIELDS = get_settings_value(
     'OPTIONAL_REGISTRATION_FIELDS',
     {
@@ -100,7 +112,7 @@ OPTIONAL_REGISTRATION_FIELDS = get_settings_value(
 try:  # pragma: no cover
     assert PASSWORD_RESET_URLS
     for key, value in PASSWORD_RESET_URLS.items():
-        if key != 'default':
+        if key != '__all__' and key != 'default':
             try:
                 UUID(key)
             except ValueError:
@@ -130,8 +142,28 @@ except AssertionError:  # pragma: no cover
     )
 
 # Path of urls that need to be refered in migrations files.
-CSV_URL_PATH = 'radiusbatch/csv/'
+CSV_URL_PATH = 'api/v1/radius/organization/'
+try:
+    PRIVATE_STORAGE_INSTANCE = import_string(
+        get_settings_value(
+            'PRIVATE_STORAGE_INSTANCE',
+            'openwisp_radius.private_storage.storage.private_file_system_storage',
+        )
+    )
+except ImportError:
+    raise ImproperlyConfigured('Failed to import PRIVATE_STORAGE_INSTANCE')
+
 CALLED_STATION_IDS = get_settings_value('CALLED_STATION_IDS', {})
+
+for organization in CALLED_STATION_IDS.keys():  # pragma: no cover
+    try:
+        UUID(organization)
+    except ValueError:
+        logger.warning(
+            'Organization slug in CALLED_STATION_IDS setting is deprecated. '
+            'It will be removed in future, please replace '
+            f'organization slug: {organization} with its id.'
+        )
 CONVERT_CALLED_STATION_ON_CREATE = get_settings_value(
     'CONVERT_CALLED_STATION_ON_CREATE', False
 )
@@ -145,19 +177,25 @@ TRAFFIC_COUNTER_CHECK_NAME = get_settings_value(
 TRAFFIC_COUNTER_REPLY_NAME = get_settings_value(
     'TRAFFIC_COUNTER_REPLY_NAME', 'ChilliSpot-Max-Total-Octets'
 )
+RADCLIENT_ATTRIBUTE_DICTIONARIES = get_settings_value(
+    'RADCLIENT_ATTRIBUTE_DICTIONARIES', []
+)
 
 # counters
 COUNTERS_POSTGRESQL = (
     'openwisp_radius.counters.postgresql.daily_counter.DailyCounter',
     'openwisp_radius.counters.postgresql.daily_traffic_counter.DailyTrafficCounter',
+    'openwisp_radius.counters.postgresql.monthly_traffic_counter.MonthlyTrafficCounter',
 )
 COUNTERS_MYSQL = (
     'openwisp_radius.counters.mysql.daily_counter.DailyCounter',
     'openwisp_radius.counters.mysql.daily_traffic_counter.DailyTrafficCounter',
+    'openwisp_radius.counters.mysql.monthly_traffic_counter.MonthlyTrafficCounter',
 )
 COUNTERS_SQLITE = (
     'openwisp_radius.counters.sqlite.daily_counter.DailyCounter',
     'openwisp_radius.counters.sqlite.daily_traffic_counter.DailyTrafficCounter',
+    'openwisp_radius.counters.sqlite.monthly_traffic_counter.MonthlyTrafficCounter',
 )
 DEFAULT_COUNTERS = {
     'django.db.backends.postgresql': COUNTERS_POSTGRESQL,

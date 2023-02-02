@@ -1,3 +1,4 @@
+import sys
 from datetime import datetime, timedelta
 from unittest import mock
 
@@ -197,7 +198,8 @@ class TestPhoneToken(BaseTestCase):
             self._create_token(user=user, phone_number=None)
         except ValidationError as e:
             self.assertIn(
-                'This field cannot be null.', str(e.message_dict['phone_number']),
+                'This field cannot be null.',
+                str(e.message_dict['phone_number']),
             )
         else:
             self.fail('ValidationError not raised')
@@ -208,3 +210,26 @@ class TestPhoneToken(BaseTestCase):
         token.valid_until += timedelta(hours=1)  # change anything to save
         token.save()
         send_messages_mock.assert_called_once()
+
+    @mock.patch('openwisp_radius.utils.SmsMessage.send')
+    @mock.patch('openwisp_radius.utils.SmsMessage.__init__', return_value=None)
+    def test_org_sms_message(self, sms_message_mock, *args):
+        radius_settings = self.default_org.radius_settings
+        radius_settings.sms_message = (
+            '{organization} custom verification message: {code}'
+        )
+        radius_settings.save()
+        token = self._create_token()
+        if sys.version_info < (3, 8):
+            # TODO: Remove when dropping support for Python 3.7
+            sms_body = sms_message_mock.call_args[1]['body']
+        else:
+            sms_body = sms_message_mock.call_args.kwargs['body']
+        self.assertEqual(
+            sms_body,
+            radius_settings.sms_message.format(
+                organization=self.default_org, code=token.token
+            ),
+        )
+        radius_settings.sms_message = None
+        radius_settings.save()

@@ -7,6 +7,7 @@ import django.core.validators
 import django.db.models.deletion
 import django.utils.timezone
 import model_utils.fields
+import swapper
 from django.conf import settings
 from django.db import migrations, models
 from swapper import get_model_name
@@ -28,8 +29,9 @@ class Migration(migrations.Migration):
     """
 
     dependencies = [
-        ('openwisp_users', '0003_default_organization'),
-        migrations.swappable_dependency(settings.AUTH_USER_MODEL),
+        swapper.dependency(
+            *swapper.split(settings.AUTH_USER_MODEL), version='0004_default_groups'
+        ),
         ('openwisp_radius', '0001_initial_freeradius'),
     ]
 

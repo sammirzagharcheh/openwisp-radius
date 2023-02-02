@@ -35,28 +35,26 @@ setup(
     include_package_data=True,
     zip_safe=False,
     install_requires=[
-        'django>=3.0,<3.2',
-        'swapper~=1.1.0',
-        # Needed for the new authentication backend in openwisp-users
-        # TODO: remove when the new version of openwisp-users is released
-        'openwisp-users @ https://github.com/openwisp/openwisp-users/tarball/master',
-        # TODO: change this when next point version of openwisp-utils is released
+        'django>=3.0,<=4.1.0',
         (
-            'openwisp-utils[rest] @'
-            'https://github.com/openwisp/openwisp-utils/tarball/master'
+            'openwisp-users '
+            '@ https://github.com/openwisp/openwisp-users/tarball/'
+            'master'
         ),
+        'openwisp-utils[rest,celery] @ '
+        'https://github.com/openwisp/openwisp-utils/tarball/master',
         'passlib~=1.7.1',
         'djangorestframework-link-header-pagination~=0.1.1',
         'weasyprint>=43,<53',
         'dj-rest-auth~=2.1.6',
-        'django-sendsms~=0.4.0',
+        'django-sendsms~=0.5.0',
         'jsonfield~=3.1.0',
-        'django-private-storage~=2.2',
-        'celery~=4.4.0',
+        'django-private-storage~=3.0',
         'django-ipware~=3.0.0',
+        'pyrad~=2.4',
     ],
     extras_require={
-        'saml': ['djangosaml2~=1.3.0'],
+        'saml': ['djangosaml2~=1.5.0'],
         'openvpn_status': ['openvpn-status~=0.2.1'],
     },
     classifiers=[

@@ -1,3 +1,8 @@
+from unittest.mock import patch
+
+from django.core.exceptions import ValidationError
+from django.urls import reverse
+
 from ..utils import load_model
 from . import FileMixin
 from .mixins import BaseTestCase
@@ -79,3 +84,60 @@ class TestCSVUpload(FileMixin, BaseTestCase):
         self.assertEqual(batch.users.all().count(), 1)
         user = batch.users.first()
         self.assertEqual(hashed_password, user.password)
+
+
+class TestPrefixUpload(FileMixin, BaseTestCase):
+    def test_invalid_username(self):
+        self.assertRaises(
+            ValidationError,
+            self._create_radius_batch,
+            name='test',
+            strategy='prefix',
+            prefix="Test#1",
+        )
+
+    def test_valid_username(self):
+        batch = self._create_radius_batch(
+            name='test', strategy='prefix', prefix='Test1'
+        )
+        batch.prefix_add('test-prefix16', 5)
+        self.assertEqual(RadiusBatch.objects.all().count(), 1)
+        self.assertEqual(batch.users.all().count(), 5)
+
+    def test_valid_username_special_char(self):
+        batch = self._create_radius_batch(
+            name='test', strategy='prefix', prefix='Test_@+-.'
+        )
+        batch.prefix_add('test-prefix16', 5)
+        self.assertEqual(RadiusBatch.objects.all().count(), 1)
+        self.assertEqual(batch.users.all().count(), 5)
+
+    @patch('openwisp_radius.settings.API_AUTHORIZE_REJECT', True)
+    def test_verified_batch_user_creation(self):
+        organization = self._get_org()
+        radius_settings = organization.radius_settings
+        auth_header = f'Bearer {organization.pk} {radius_settings.token}'
+        radius_settings.needs_identity_verification = True
+        radius_settings.full_clean()
+        radius_settings.save()
+        batch = self._create_radius_batch(
+            name='test', strategy='prefix', prefix='Test', organization=organization
+        )
+        batch.prefix_add('test-prefix', 1)
+        user = batch.users.first()
+        response = self.client.post(
+            reverse('radius:authorize'),
+            {'username': user.username, 'password': batch.user_credentials[0][1]},
+            HTTP_AUTHORIZATION=auth_header,
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json(),
+            {
+                'control:Auth-Type': 'Accept',
+                'Session-Timeout': 10800,
+                'ChilliSpot-Max-Total-Octets': 3000000000,
+            },
+        )
+        self.assertEqual(user.registered_user.is_verified, True)
+        self.assertEqual(user.registered_user.method, 'manual')

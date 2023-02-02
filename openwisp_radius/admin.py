@@ -1,3 +1,5 @@
+from urllib.parse import urljoin
+
 from django import forms
 from django.conf import settings
 from django.contrib import admin, messages
@@ -5,7 +7,7 @@ from django.contrib.admin import ModelAdmin, StackedInline
 from django.contrib.admin.utils import model_ngettext
 from django.contrib.auth import get_user_model
 from django.core.exceptions import PermissionDenied
-from django.forms.widgets import Select
+from django.templatetags.static import static
 from django.urls import reverse
 from django.utils.safestring import mark_safe
 from django.utils.translation import gettext_lazy as _
@@ -19,22 +21,9 @@ from openwisp_utils.admin import (
 )
 
 from . import settings as app_settings
-from .base.admin_actions import disable_action, enable_action
-from .base.admin_filters import (
-    DuplicateListFilter,
-    ExpiredListFilter,
-    RegisteredUserFilter,
-)
-from .base.forms import ModeSwitcherForm, RadiusBatchForm, RadiusCheckForm
-from .base.models import (
-    _GET_IP_LIST_HELP_TEXT,
-    _GET_MOBILE_PREFIX_HELP_TEXT,
-    _GET_OPTIONAL_FIELDS_HELP_TEXT,
-    _IDENTITY_VERIFICATION_ENABLED_HELP_TEXT,
-    _REGISTRATION_ENABLED_HELP_TEXT,
-    OPTIONAL_FIELD_CHOICES,
-    _encode_secret,
-)
+from .base.admin_filters import RegisteredUserFilter
+from .base.forms import ModeSwitcherForm, RadiusBatchForm
+from .settings import RADIUS_API_BASEURL, RADIUS_API_URLCONF
 from .utils import load_model
 
 Nas = load_model('Nas')
@@ -73,28 +62,22 @@ class AlwaysHasChangedForm(AlwaysHasChangedMixin, forms.ModelForm):
 
 @admin.register(RadiusCheck)
 class RadiusCheckAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
+    form = ModeSwitcherForm
     list_display = [
         'username',
         'organization',
         'attribute',
         'op',
         'value',
-        'is_active',
-        'valid_until',
         'created',
         'modified',
     ]
     search_fields = ['username', 'value']
     list_filter = [
-        DuplicateListFilter,
-        ('organization', MultitenantOrgFilter),
-        ExpiredListFilter,
+        MultitenantOrgFilter,
         'created',
         'modified',
-        'valid_until',
     ]
-    readonly_fields = ['value']
-    form = RadiusCheckForm
     fields = [
         'mode',
         'organization',
@@ -103,33 +86,15 @@ class RadiusCheckAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         'op',
         'attribute',
         'value',
-        'new_value',
-        'is_active',
-        'valid_until',
-        'notes',
         'created',
         'modified',
     ]
-    autocomplete_fields = ['user']
-    actions = TimeStampedEditableAdmin.actions + [disable_action, enable_action]
-
-    def save_model(self, request, obj, form, change):
-        if form.data.get('new_value'):
-            obj.value = _encode_secret(
-                form.data['attribute'], form.data.get('new_value')
-            )
-        obj.save()
-
-    def get_fields(self, request, obj=None):
-        """ do not show raw value (readonly) when adding a new item """
-        fields = self.fields[:]
-        if not obj:
-            fields.remove('value')
-        return fields
+    autocomplete_fields = ('user',)
 
 
 @admin.register(RadiusReply)
 class RadiusReplyAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
+    form = ModeSwitcherForm
     list_display = [
         'username',
         'organization',
@@ -139,9 +104,7 @@ class RadiusReplyAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         'created',
         'modified',
     ]
-    autocomplete_fields = ['user']
-    form = ModeSwitcherForm
-    list_filter = (('organization', MultitenantOrgFilter),)
+    list_filter = (MultitenantOrgFilter,)
     fields = [
         'mode',
         'organization',
@@ -153,6 +116,7 @@ class RadiusReplyAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         'created',
         'modified',
     ]
+    autocomplete_fields = ('user',)
 
 
 BaseAccounting = ReadOnlyAdmin if not app_settings.EDITABLE_ACCOUNTING else ModelAdmin
@@ -179,7 +143,7 @@ class RadiusAccountingAdmin(OrganizationFirstMixin, BaseAccounting):
         'called_station_id',
         'nas_ip_address',
     ]
-    list_filter = ['start_time', 'stop_time', ('organization', MultitenantOrgFilter)]
+    list_filter = ['start_time', 'stop_time', MultitenantOrgFilter]
     ordering = ['-start_time']
 
 
@@ -213,15 +177,7 @@ class NasAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         'created',
         'modified',
     ]
-    list_filter = (('organization', MultitenantOrgFilter),)
-
-    def save_model(self, request, obj, form, change):
-        data = form.cleaned_data
-        obj.type = data.get('custom_type') or data.get('type')
-        super(NasAdmin, self).save_model(request, obj, form, change)
-
-    class Media:
-        css = {'all': ('openwisp-radius/css/nas.css',)}
+    list_filter = (MultitenantOrgFilter,)
 
 
 class RadiusGroupCheckInline(TimeReadonlyAdminMixin, StackedInline):
@@ -248,7 +204,7 @@ class RadiusGroupAdmin(OrganizationFirstMixin, TimeStampedEditableAdmin):
         'modified',
     ]
     search_fields = ['name']
-    list_filter = (('organization', MultitenantOrgFilter),)
+    list_filter = (MultitenantOrgFilter,)
     inlines = [RadiusGroupCheckInline, RadiusGroupReplyInline]
     select_related = ('organization',)
 
@@ -295,7 +251,7 @@ class RadiusGroupAdmin(OrganizationFirstMixin, TimeStampedEditableAdmin):
     actions = ['delete_selected_groups']
 
     def get_default_queryset(self, request, queryset):
-        """ overridable """
+        """overridable"""
         return queryset.filter(default=True)
 
 
@@ -369,7 +325,7 @@ class RadiusPostAuthAdmin(OrganizationFirstMixin, BasePostAuth):
     list_filter = [
         'date',
         'reply',
-        ('organization', MultitenantOrgFilter),
+        MultitenantOrgFilter,
     ]
     search_fields = ['username', 'reply', 'calling_station_id', 'called_station_id']
     exclude = ['id']
@@ -379,6 +335,7 @@ class RadiusPostAuthAdmin(OrganizationFirstMixin, BasePostAuth):
 @admin.register(RadiusBatch)
 class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
     change_form_template = 'openwisp-radius/admin/rad_batch_users_change_form.html'
+    add_form_template = 'openwisp-radius/admin/rad_batch_users_add_form.html'
     list_display = [
         'name',
         'organization',
@@ -401,17 +358,35 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
     ]
     list_filter = [
         'strategy',
-        ('organization', MultitenantOrgFilter),
+        MultitenantOrgFilter,
     ]
     search_fields = ['name']
     form = RadiusBatchForm
+    help_text = {
+        'text': _(
+            'Users imported or generated through this form will be flagged '
+            'as verified if the organization requires identity verification, '
+            'otherwise the generated users would not be able to log in. '
+            'If this organization requires identity verification, make sure '
+            'the identity of the users is verified before before '
+            'giving out the credentials.'
+        ),
+        'documentation_url': (
+            'https://openwisp-radius.readthedocs.io/en/latest/user/importing_users.html'
+        ),
+    }
 
     class Media:
         js = [
             'admin/js/jquery.init.js',
             'openwisp-radius/js/strategy-switcher.js',
         ]
-        css = {'all': ('openwisp-radius/css/radiusbatch.css',)}
+        css = {
+            'all': (
+                'openwisp-radius/css/radiusbatch.css',
+                'admin/css/help-text-stacked.css',
+            )
+        }
 
     def number_of_users(self, obj):
         return obj.users.count()
@@ -445,15 +420,34 @@ class RadiusBatchAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
 
     def change_view(self, request, object_id, form_url='', extra_context=None):
         extra_context = extra_context or {}
-        radbatch = RadiusBatch.objects.get(pk=object_id)
+        radbatch = self.get_object(request, object_id)
+        if radbatch is None:
+            # This is an internal Django method that redirects the
+            # user to the admin index page with a message that points
+            # out that the requested object does not exist.
+            return self._get_obj_does_not_exist_redirect(
+                request, self.model._meta, object_id
+            )
         if radbatch.strategy == 'prefix':
-            extra_context['download_rad_batch_pdf_url'] = reverse(
+            batch_pdf_api_url = reverse(
                 'radius:download_rad_batch_pdf',
+                urlconf=RADIUS_API_URLCONF,
                 args=[radbatch.organization.slug, object_id],
             )
+            if RADIUS_API_BASEURL:
+                batch_pdf_api_url = urljoin(RADIUS_API_BASEURL, batch_pdf_api_url)
+            extra_context['download_rad_batch_pdf_url'] = batch_pdf_api_url
         return super().change_view(
-            request, object_id, form_url, extra_context=extra_context,
+            request,
+            object_id,
+            form_url,
+            extra_context=extra_context,
         )
+
+    def add_view(self, request, form_url='', extra_context=None):
+        extra_context = extra_context or {}
+        extra_context['help_text'] = self.help_text
+        return super().add_view(request, form_url, extra_context)
 
     def get_actions(self, request):
         actions = super().get_actions(request)
@@ -534,8 +528,8 @@ def get_is_verified(self, obj):
         value = 'yes' if obj.registered_user.is_verified else 'no'
     except Exception:
         value = 'unknown'
-
-    return mark_safe(f'<img src="/static/admin/img/icon-{value}.svg" alt="{value}">')
+    icon_url = static(f'admin/img/icon-{value}.svg')
+    return mark_safe(f'<img src="{icon_url}" alt="{value}">')
 
 
 UserAdmin.get_is_verified = get_is_verified
@@ -544,109 +538,9 @@ UserAdmin.list_display.insert(3, 'get_is_verified')
 UserAdmin.list_select_related = ('registered_user',)
 
 
-class FallbackFieldMixin(object):
-    def __init__(self, fallback, *args, **kwargs):
-        self.fallback = fallback
-        super().__init__(*args, **kwargs)
-
-    def prepare_value(self, value):
-        if value is None:
-            value = self.fallback
-        return super().prepare_value(value)
-
-
-class FallbackCharField(FallbackFieldMixin, forms.CharField):
-    pass
-
-
-class FallbackChoiceField(FallbackFieldMixin, forms.ChoiceField):
-    pass
-
-
-class FallbackNullChoiceField(FallbackFieldMixin, forms.NullBooleanField):
-    pass
-
-
-def _enabled_disabled_helper(field):
-    if getattr(app_settings, field):
-        return _('Enabled')
-    return _('Disabled')
-
-
-class OrganizationRadiusSettingsForm(AlwaysHasChangedMixin, forms.ModelForm):
-    freeradius_allowed_hosts = FallbackCharField(
-        required=False,
-        widget=forms.Textarea(attrs={'rows': 2, 'cols': 34}),
-        help_text=_GET_IP_LIST_HELP_TEXT,
-        fallback=','.join(app_settings.FREERADIUS_ALLOWED_HOSTS),
-    )
-    allowed_mobile_prefixes = FallbackCharField(
-        required=False,
-        widget=forms.Textarea(attrs={'rows': 2, 'cols': 34}),
-        help_text=_GET_MOBILE_PREFIX_HELP_TEXT,
-        fallback=','.join(app_settings.ALLOWED_MOBILE_PREFIXES),
-    )
-    registration_enabled = FallbackNullChoiceField(
-        required=False,
-        widget=Select(
-            choices=[
-                (
-                    '',
-                    _('Default')
-                    + f' ({_enabled_disabled_helper("REGISTRATION_API_ENABLED")})',
-                ),
-                (True, _('Enabled')),
-                (False, _('Disabled')),
-            ]
-        ),
-        help_text=_REGISTRATION_ENABLED_HELP_TEXT,
-        fallback='',
-    )
-    needs_identity_verification = FallbackNullChoiceField(
-        required=False,
-        widget=Select(
-            choices=[
-                (
-                    '',
-                    _('Default')
-                    + f' ({_enabled_disabled_helper("NEEDS_IDENTITY_VERIFICATION")})',
-                ),
-                (True, _('Enabled')),
-                (False, _('Disabled')),
-            ]
-        ),
-        help_text=_IDENTITY_VERIFICATION_ENABLED_HELP_TEXT,
-        fallback='',
-    )
-    first_name = FallbackChoiceField(
-        required=False,
-        help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
-        choices=OPTIONAL_FIELD_CHOICES,
-        fallback=OPTIONAL_SETTINGS.get('first_name', 'disabled'),
-    )
-    last_name = FallbackChoiceField(
-        required=False,
-        help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
-        choices=OPTIONAL_FIELD_CHOICES,
-        fallback=OPTIONAL_SETTINGS.get('last_name', 'disabled'),
-    )
-    location = FallbackChoiceField(
-        required=False,
-        help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
-        choices=OPTIONAL_FIELD_CHOICES,
-        fallback=OPTIONAL_SETTINGS.get('location', 'disabled'),
-    )
-    birth_date = FallbackChoiceField(
-        required=False,
-        help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
-        choices=OPTIONAL_FIELD_CHOICES,
-        fallback=OPTIONAL_SETTINGS.get('birth_date', 'disabled'),
-    )
-
-
 class OrganizationRadiusSettingsInline(admin.StackedInline):
     model = OrganizationRadiusSettings
-    form = OrganizationRadiusSettingsForm
+    form = AlwaysHasChangedForm
     fieldsets = (
         (
             None,
@@ -654,15 +548,22 @@ class OrganizationRadiusSettingsInline(admin.StackedInline):
                 'fields': (
                     'token',
                     'freeradius_allowed_hosts',
+                    'coa_enabled',
                     'registration_enabled',
+                    'saml_registration_enabled',
+                    'social_registration_enabled',
                     'needs_identity_verification',
+                    'sms_verification',
                     'first_name',
                     'last_name',
                     'birth_date',
                     'location',
-                    'sms_verification',
                     'sms_sender',
+                    'sms_message',
                     'allowed_mobile_prefixes',
+                    'login_url',
+                    'status_url',
+                    'password_reset_url',
                 )
             },
         ),
@@ -678,7 +579,7 @@ OrganizationAdmin.inlines.insert(2, OrganizationRadiusSettingsInline)
 
 # avoid cluttering the admin with too many models, leave only the
 # minimum required to configure social login and check if it's working
-if app_settings.SOCIAL_LOGIN_ENABLED:
+if app_settings.SOCIAL_REGISTRATION_CONFIGURED:
     from allauth.socialaccount.admin import SocialAccount, SocialApp, SocialAppAdmin
 
     class SocialAccountInline(admin.StackedInline):
@@ -696,10 +597,37 @@ if app_settings.SOCIAL_LOGIN_ENABLED:
     admin.site.register(SocialApp, SocialAppAdmin)
 
 
+if app_settings.USER_ADMIN_RADIUSTOKEN_INLINE:
+
+    class RadiusTokenInline(TimeReadonlyAdminMixin, admin.StackedInline):
+        model = RadiusToken
+        extra = 0
+
+        def get_exclude(self, request, obj=None):
+            fields = super().get_exclude(request, obj) or []
+            if not hasattr(obj, 'radius_token'):
+                return fields + ['key']
+            return fields
+
+        def get_formset(self, request, obj=None, **kwargs):
+            kwargs['widgets'] = kwargs.get('widgets', {})
+            kwargs['widgets'].update(
+                {
+                    'key': forms.widgets.TextInput(
+                        attrs={'class': 'readonly vTextField', 'readonly': True}
+                    )
+                }
+            )
+            return super().get_formset(request, obj, **kwargs)
+
+    UserAdmin.inlines.insert(0, RadiusTokenInline)
+
 if settings.DEBUG:
 
     @admin.register(RadiusToken)
-    class RadiusTokenAdmin(ModelAdmin):
+    class RadiusTokenAdmin(MultitenantAdminMixin, TimeStampedEditableAdmin):
         list_display = ['key', 'user', 'created']
         fields = ['user', 'organization', 'can_auth']
         ordering = ('-created',)
+        list_filter = [MultitenantOrgFilter]
+        autocomplete_fields = ('user',)

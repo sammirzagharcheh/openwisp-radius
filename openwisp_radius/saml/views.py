@@ -4,7 +4,7 @@ from urllib.parse import parse_qs, urlparse
 import swapper
 from django.conf import settings
 from django.contrib.auth import logout
-from django.core.exceptions import ObjectDoesNotExist
+from django.core.exceptions import ObjectDoesNotExist, PermissionDenied
 from django.shortcuts import get_object_or_404, render
 from djangosaml2.views import (
     AssertionConsumerServiceView as BaseAssertionConsumerServiceView,
@@ -15,7 +15,7 @@ from rest_framework.authtoken.models import Token
 
 from .. import settings as app_settings
 from ..api.views import RadiusTokenMixin
-from ..utils import load_model
+from ..utils import get_organization_radius_settings, load_model
 from .utils import get_url_or_path
 
 logger = logging.getLogger(__name__)
@@ -31,7 +31,8 @@ class OrganizationSamlMixin(object):
         try:
             parsed_url = urlparse(
                 self.request.POST.get(
-                    'RelayState', self.request.GET.get('RelayState', None),
+                    'RelayState',
+                    self.request.GET.get('RelayState', None),
                 )
             )
 
@@ -50,8 +51,11 @@ class AssertionConsumerServiceView(
     OrganizationSamlMixin, RadiusTokenMixin, BaseAssertionConsumerServiceView
 ):
     def post_login_hook(self, request, user, session_info):
-        """ If desired, a hook to add logic after a user has successfully logged in.
-        """
+        """If desired, a hook to add logic after a user has successfully logged in."""
+        # In some cases, it possible that the organization cache for
+        # the user is not updated before execution of the following
+        # code. Hence, the cache is manually updated here.
+        user._invalidate_user_organizations_dict()
         org = self.get_organization_from_relay_state()
         is_member = user.is_member(org)
         # add user to organization
@@ -69,15 +73,17 @@ class AssertionConsumerServiceView(
             registered_user.save()
 
     def customize_relay_state(self, relay_state):
-        """ Subclasses may override this method to implement custom logic for relay state.
+        """
+        Subclasses may override this method to
+        implement custom logic for relay state.
         """
         return get_url_or_path(relay_state)
 
     def custom_redirect(self, user, relay_state, session_info):
-        """ Subclasses may override this method to implement custom logic for redirect.
+        """Subclasses may override this method to implement custom logic for redirect.
 
-            For example, some sites may require user registration if the user has not
-            yet been provisioned.
+        For example, some sites may require user registration if the user has not
+        yet been provisioned.
         """
         Token.objects.filter(user=user).delete()
         token, _ = Token.objects.get_or_create(user=user)
@@ -101,12 +107,20 @@ class LoginView(OrganizationSamlMixin, BaseLoginView):
         # Check correct organization slug is present in the request
         try:
             org_slug = self.get_org_slug_from_relay_state()
-            assert Organization.objects.filter(
+            organization = Organization.objects.only('id', 'radius_settings').get(
                 slug=org_slug
-            ).exists(), 'Organization with the provided slug does not exist'
-        except (ValueError, AssertionError) as error:
-            logger.error(str(error))
+            )
+        except (ValueError, ObjectDoesNotExist) as error:
+            if isinstance(error, ObjectDoesNotExist):
+                logger.error('Organization with the provided slug does not exist')
+            else:
+                logger.error(str(error))
             return render(request, 'djangosaml2/login_error.html')
+        else:
+            if not get_organization_radius_settings(
+                organization, 'saml_registration_enabled'
+            ):
+                raise PermissionDenied()
 
         # Log out the user before initiating the SAML flow
         # to avoid past sessions to get in the way and break the flow

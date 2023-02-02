@@ -1,20 +1,24 @@
 import os
 from unittest import mock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import swapper
 from django.apps.registry import apps
 from django.conf import settings
 from django.contrib.auth import get_user_model
 from django.core.exceptions import ValidationError
+from django.db import connection
 from django.db.models import ProtectedError
-from django.test import override_settings
 from django.urls import reverse
+from django.utils import timezone
 from netaddr import EUI, mac_unix
 
 from openwisp_users.tests.utils import TestMultitenantAdminMixin
+from openwisp_utils.tests import capture_any_output, capture_stderr
 
 from .. import settings as app_settings
+from ..radclient.client import RadClient
+from ..tasks import perform_change_of_authorization
 from ..utils import (
     DEFAULT_SESSION_TIME_LIMIT,
     DEFAULT_SESSION_TRAFFIC_LIMIT,
@@ -22,8 +26,8 @@ from ..utils import (
     SESSION_TRAFFIC_ATTRIBUTE,
     load_model,
 )
-from . import _RADACCT, FileMixin
-from .mixins import BaseTestCase
+from . import _CALLED_STATION_IDS, _RADACCT, FileMixin
+from .mixins import BaseTestCase, BaseTransactionTestCase
 
 Nas = load_model('Nas')
 RadiusAccounting = load_model('RadiusAccounting')
@@ -35,6 +39,7 @@ RadiusGroupCheck = load_model('RadiusGroupCheck')
 RadiusGroupReply = load_model('RadiusGroupReply')
 RadiusUserGroup = load_model('RadiusUserGroup')
 RadiusBatch = load_model('RadiusBatch')
+OrganizationRadiusSettings = load_model('OrganizationRadiusSettings')
 Organization = swapper.load_model('openwisp_users', 'Organization')
 
 
@@ -73,24 +78,7 @@ class TestRadiusAccounting(FileMixin, BaseTestCase):
         radiusaccounting.framed_ipv6_prefix = 'invalid ipv6_prefix'
         self.assertRaises(ValidationError, radiusaccounting.full_clean)
 
-    @mock.patch.object(
-        app_settings,
-        'CALLED_STATION_IDS',
-        {
-            'test-org': {
-                'openvpn_config': [
-                    {'host': '127.0.0.1', 'port': 7505, 'password': 'somepassword'}
-                ],
-                'unconverted_ids': ['AA-AA-AA-AA-AA-0A'],
-            }
-        },
-    )
-    @mock.patch.object(app_settings, 'OPENVPN_DATETIME_FORMAT', u'%Y-%m-%d %H:%M:%S')
-    @mock.patch.object(app_settings, 'CONVERT_CALLED_STATION_ON_CREATE', True)
-    def test_convert_called_station_id(self):
-        RadiusAppConfig = apps.get_app_config(RadiusAccounting._meta.app_label)
-        RadiusAppConfig.connect_signals()
-
+    def convert_called_station_id_tests(self):
         radiusaccounting_options = _RADACCT.copy()
         radiusaccounting_options.update(
             {
@@ -101,8 +89,17 @@ class TestRadiusAccounting(FileMixin, BaseTestCase):
                 'called_station_id': 'AA-AA-AA-AA-AA-0A',
             }
         )
+        with self.subTest('Settings disabled'):
+            options = radiusaccounting_options.copy()
+            options['unique_id'] = '113'
+            radiusaccounting = self._create_radius_accounting(**options)
+            radiusaccounting.refresh_from_db()
+            self.assertEqual(radiusaccounting.called_station_id, 'AA-AA-AA-AA-AA-0A')
 
-        with self.subTest('CALLED_STATAION_ID not defined for organization'):
+        RadiusAppConfig = apps.get_app_config(RadiusAccounting._meta.app_label)
+        RadiusAppConfig.connect_signals()
+
+        with self.subTest('CALLED_STATION_ID not defined for organization'):
             options = radiusaccounting_options.copy()
             options['unique_id'] = '111'
             options['organization'] = self._create_org(name='new-org')
@@ -118,18 +115,6 @@ class TestRadiusAccounting(FileMixin, BaseTestCase):
             radiusaccounting.refresh_from_db()
             self.assertEqual(radiusaccounting.called_station_id, 'EE-EE-EE-EE-EE-EE')
 
-        with self.subTest('Settings disabled'):
-            with override_settings(
-                OPENWISP_RADIUS_CONVERT_CALLED_STATION_ON_CREATE=False
-            ):
-                options = radiusaccounting_options.copy()
-                options['unique_id'] = '113'
-                radiusaccounting = self._create_radius_accounting(**options)
-                radiusaccounting.refresh_from_db()
-                self.assertEqual(
-                    radiusaccounting.called_station_id, 'AA-AA-AA-AA-AA-0A'
-                )
-
         with self.subTest('Ideal condition'):
             with self._get_openvpn_status_mock():
                 options = radiusaccounting_options.copy()
@@ -139,6 +124,69 @@ class TestRadiusAccounting(FileMixin, BaseTestCase):
                 self.assertEqual(
                     radiusaccounting.called_station_id, 'CC-CC-CC-CC-CC-0C'
                 )
+
+    def test_multiple_accounting_sessions(self):
+        radiusaccounting_options = _RADACCT.copy()
+        radiusaccounting_options.update(
+            {
+                'organization': self.default_org,
+                'nas_ip_address': '192.168.182.3',
+                'framed_ipv6_prefix': '::/64',
+                'calling_station_id': str(EUI('bb:bb:bb:bb:bb:0b', dialect=mac_unix)),
+                'called_station_id': 'AA-AA-AA-AA-AA-0A',
+            }
+        )
+
+        with self.subTest('Test new session with same called_station_id'):
+            radiusaccounting1 = self._create_radius_accounting(
+                unique_id='111', update_time=timezone.now(), **radiusaccounting_options
+            )
+            radiusaccounting2 = self._create_radius_accounting(
+                unique_id='112', update_time=timezone.now(), **radiusaccounting_options
+            )
+            radiusaccounting1.refresh_from_db()
+            radiusaccounting2.refresh_from_db()
+            self.assertEqual(radiusaccounting1.terminate_cause, 'Session-Timeout')
+            self.assertEqual(radiusaccounting1.stop_time, radiusaccounting1.update_time)
+            self.assertEqual(radiusaccounting2.stop_time, None)
+
+        with self.subTest('Test different called_session_id'):
+            self.assertEqual(
+                RadiusAccounting.objects.filter(stop_time__isnull=True).count(), 1
+            )
+            radiusaccounting_options['called_station_id'] = 'AA-AA-AA-AA-AA-0B'
+            self._create_radius_accounting(
+                unique_id='113', **radiusaccounting_options, update_time=timezone.now()
+            )
+            radiusaccounting2.refresh_from_db()
+            self.assertEqual(RadiusAccounting.objects.filter(stop_time=None).count(), 2)
+            self.assertEqual(radiusaccounting2.terminate_cause, None)
+            self.assertEqual(radiusaccounting2.stop_time, None)
+
+    @capture_any_output()
+    @mock.patch.object(app_settings, 'OPENVPN_DATETIME_FORMAT', u'%Y-%m-%d %H:%M:%S')
+    @mock.patch.object(app_settings, 'CONVERT_CALLED_STATION_ON_CREATE', True)
+    def test_convert_called_station_id_with_organization_id(self, *args, **kwargs):
+        called_station_ids = {
+            str(self._get_org().id): _CALLED_STATION_IDS.get('test-org')
+        }
+        with mock.patch.object(
+            app_settings,
+            'CALLED_STATION_IDS',
+            called_station_ids,
+        ):
+            self.convert_called_station_id_tests()
+
+    @capture_any_output()
+    @mock.patch.object(
+        app_settings,
+        'CALLED_STATION_IDS',
+        _CALLED_STATION_IDS,
+    )
+    @mock.patch.object(app_settings, 'OPENVPN_DATETIME_FORMAT', u'%Y-%m-%d %H:%M:%S')
+    @mock.patch.object(app_settings, 'CONVERT_CALLED_STATION_ON_CREATE', True)
+    def test_convert_called_station_id_with_organization_slug(self, *args, **kwargs):
+        self.convert_called_station_id_tests()
 
 
 class TestRadiusCheck(BaseTestCase):
@@ -195,21 +243,15 @@ class TestRadiusCheck(BaseTestCase):
         # ensure related records have been updated
         self.assertEqual(c.username, u.username)
 
-    def test_auto_value(self):
-        obj = self._create_radius_check(
-            username='Monica', value='Cam0_liX', attribute='NT-Password', op=':='
-        )
-        self.assertEqual(obj.value, '891fc570507eef023cbfec043dd5f2b1')
-
     def test_create_radius_check_model(self):
         obj = RadiusCheck.objects.create(
             organization=self.default_org,
             username='Monica',
-            new_value='Cam0_liX',
+            value='Cam0_liX',
             attribute='NT-Password',
             op=':=',
         )
-        self.assertEqual(obj.value, '891fc570507eef023cbfec043dd5f2b1')
+        self.assertEqual(obj.value, 'Cam0_liX')
 
     def test_user_different_organization(self):
         org1 = self._create_org(**{'name': 'org1', 'slug': 'org1'})
@@ -228,6 +270,40 @@ class TestRadiusCheck(BaseTestCase):
             )
         except ValidationError as e:
             self.assertIn('organization', e.message_dict)
+        else:
+            self.fail('ValidationError not raised')
+
+    def test_radius_check_unique_attribute(self):
+        org1 = self._create_org(**{'name': 'org1', 'slug': 'org1'})
+        u = get_user_model().objects.create(
+            username='test', email='test@test.org', password='test'
+        )
+        self._create_org_user(organization=org1, user=u)
+        self._create_radius_check(
+            user=u,
+            op=':=',
+            attribute='Max-Daily-Session',
+            value='3600',
+            organization=org1,
+        )
+        try:
+            self._create_radius_check(
+                user=u,
+                op=':=',
+                attribute='Max-Daily-Session',
+                value='3200',
+                organization=org1,
+            )
+        except ValidationError as e:
+            self.assertEqual(
+                {
+                    'attribute': [
+                        'Another check for the same user and with the '
+                        'same attribute already exists.'
+                    ]
+                },
+                e.message_dict,
+            )
         else:
             self.fail('ValidationError not raised')
 
@@ -306,6 +382,40 @@ class TestRadiusReply(BaseTestCase):
         else:
             self.fail('ValidationError not raised')
 
+    def test_radius_reply_unique_attribute(self):
+        org1 = self._create_org(**{'name': 'org1', 'slug': 'org1'})
+        u = get_user_model().objects.create(
+            username='test', email='test@test.org', password='test'
+        )
+        self._create_org_user(organization=org1, user=u)
+        self._create_radius_reply(
+            user=u,
+            attribute='Reply-Message',
+            op=':=',
+            value='Login failed',
+            organization=org1,
+        )
+        try:
+            self._create_radius_reply(
+                user=u,
+                attribute='Reply-Message',
+                op='=',
+                value='Login failed',
+                organization=org1,
+            )
+        except ValidationError as e:
+            self.assertEqual(
+                {
+                    'attribute': [
+                        'Another reply for the same user and with the '
+                        'same attribute already exists.'
+                    ]
+                },
+                e.message_dict,
+            )
+        else:
+            self.fail('ValidationError not raised')
+
 
 class TestRadiusPostAuth(BaseTestCase):
     def test_string_representation(self):
@@ -317,51 +427,6 @@ class TestRadiusPostAuth(BaseTestCase):
     def test_id(self):
         radiuspostauth = RadiusPostAuth(username='test id')
         self.assertIsInstance(radiuspostauth.pk, UUID)
-
-
-class TestOrganizationRadiusSettings(BaseTestCase):
-
-    optional_settings_params = {
-        'first_name': 'disabled',
-        'last_name': 'allowed',
-        'birth_date': 'disabled',
-        'location': 'mandatory',
-    }
-
-    @mock.patch.object(
-        app_settings, 'OPTIONAL_REGISTRATION_FIELDS', optional_settings_params,
-    )
-    def test_org_settings_same_globally(self):
-        org = self._get_org()
-        org.radius_settings.first_name = 'disabled'
-        org.radius_settings.last_name = 'allowed'
-        org.radius_settings.location = 'mandatory'
-        org.radius_settings.birth_date = 'disabled'
-        org.radius_settings.full_clean()
-        org.radius_settings.save()
-
-        self.assertIsNone(org.radius_settings.first_name)
-        self.assertIsNone(org.radius_settings.last_name)
-        self.assertIsNone(org.radius_settings.location)
-        self.assertIsNone(org.radius_settings.birth_date)
-
-    def test_get_registration_enabled(self):
-        rad_setting = self._get_org().radius_settings
-
-        with self.subTest('Test registration enabled set to True'):
-            rad_setting.registration_enabled = True
-            self.assertEqual(rad_setting.get_registration_enabled(), True)
-
-        with self.subTest('Test registration enabled set to False'):
-            rad_setting.registration_enabled = False
-            self.assertEqual(rad_setting.get_registration_enabled(), False)
-
-        with self.subTest('Test registration enabled set to None'):
-            rad_setting.registration_enabled = None
-            self.assertEqual(
-                rad_setting.get_registration_enabled(),
-                app_settings.REGISTRATION_API_ENABLED,
-            )
 
 
 class TestRadiusGroup(BaseTestCase):
@@ -627,6 +692,51 @@ class TestRadiusGroup(BaseTestCase):
         else:
             self.fail('ValidationError not raised')
 
+    def test_unique_attribute(self):
+        org = self._create_org(**{'name': 'Cool WiFi', 'slug': 'cool-wifi'})
+        rg = RadiusGroup(name='guests', organization=org)
+        rg.save()
+        with self.subTest('test radius group check unique attribute'):
+            self._create_radius_groupcheck(
+                group=rg, attribute='Max-Daily-Session', op=':=', value='3600'
+            )
+            try:
+                self._create_radius_groupcheck(
+                    group=rg, attribute='Max-Daily-Session', op=':=', value='3200'
+                )
+            except ValidationError as e:
+                self.assertEqual(
+                    {
+                        'attribute': [
+                            'Another group check for the same group and with the '
+                            'same attribute already exists.'
+                        ]
+                    },
+                    e.message_dict,
+                )
+            else:
+                self.fail('ValidationError not raised')
+        with self.subTest('test radius reply unique attribute'):
+            self._create_radius_groupreply(
+                group=rg, attribute='Reply-Message', op=':=', value='Login failed'
+            )
+            try:
+                self._create_radius_groupreply(
+                    group=rg, attribute='Reply-Message', op=':=', value='Login failed'
+                )
+            except ValidationError as e:
+                self.assertEqual(
+                    {
+                        'attribute': [
+                            'Another group reply for the same group and with the '
+                            'same attribute already exists.'
+                        ]
+                    },
+                    e.message_dict,
+                )
+            else:
+                self.fail('ValidationError not raised')
+
 
 class TestRadiusBatch(BaseTestCase):
     def test_string_representation(self):
@@ -687,7 +797,10 @@ class TestPrivateCsvFile(FileMixin, TestMultitenantAdminMixin, BaseTestCase):
 
     def _download_csv_file_status(self, status_code):
         response = self.client.get(
-            reverse('radius:serve_private_file', args=[self.csvfile],)
+            reverse(
+                'radius:serve_private_file',
+                args=[self.csvfile],
+            )
         )
         self.assertEqual(response.status_code, status_code)
 
@@ -739,3 +852,268 @@ class TestPrivateCsvFile(FileMixin, TestMultitenantAdminMixin, BaseTestCase):
         user = self._get_admin()
         self.client.force_login(user)
         self._download_csv_file_status(200)
+
+    def test_delete_csv_file(self):
+        file_storage_backend = RadiusBatch.csvfile.field.storage
+
+        with self.subTest('Test deleting object deletes file'):
+            batch = self._create_radius_batch(
+                name='test1', strategy='csv', csvfile=self.csvfile
+            )
+            file_name = batch.csvfile.name
+            self.assertEqual(file_storage_backend.exists(file_name), True)
+            batch.delete()
+            self.assertEqual(file_storage_backend.exists(file_name), False)
+
+        with self.subTest('Test deleting object with a deleted file'):
+            batch = self._create_radius_batch(
+                name='test2', strategy='csv', csvfile=self.csvfile
+            )
+            file_name = batch.csvfile.name
+            # Delete the file from the storage backend before
+            # deleting the object
+            file_storage_backend.delete(file_name)
+            self.assertNotEqual(batch.csvfile, None)
+            batch.delete()
+
+        with self.subTest('Test deleting object without csvfile'):
+            batch = self._create_radius_batch(
+                name='test3', strategy='prefix', prefix='test-prefix16'
+            )
+            batch.delete()
+
+
+class TestOrganizationRadiusSettings(BaseTestCase):
+    def test_fallback_field_falsy_values(self):
+        org = self._get_org()
+        rad_settings = org.radius_settings
+
+        def _verify_none_database_value(field_name):
+            setattr(rad_settings, field_name, '')
+            rad_settings.full_clean()
+            rad_settings.save()
+            with connection.cursor() as cursor:
+                cursor.execute(
+                    f'SELECT {field_name} FROM'
+                    f' {rad_settings._meta.app_label}_{rad_settings._meta.model_name}'
+                    f' WHERE id = \'{rad_settings.id.hex}\';',
+                )
+                row = cursor.fetchone()
+            self.assertEqual(row[0], None)
+
+        with self.subTest('Test "sms_message" field'):
+            _verify_none_database_value('sms_message')
+
+        with self.subTest('Test "freeradius_allowed_hosts" field'):
+            _verify_none_database_value('freeradius_allowed_hosts')
+
+        with self.subTest('Test "allowed_mobile_prefixes" field'):
+            _verify_none_database_value('allowed_mobile_prefixes')
+
+        with self.subTest('Test "password_reset_url" field'):
+            _verify_none_database_value('password_reset_url')
+
+
+class TestChangeOfAuthorization(BaseTransactionTestCase):
+    def _change_radius_user_group(self, user, organization):
+        rad_user_group = user.radiususergroup_set.first()
+        power_user_group = RadiusGroup.objects.get(
+            organization=organization, name__contains='power-users'
+        )
+        rad_user_group.group = power_user_group
+        rad_user_group.save()
+
+    def _create_radius_accounting(self, user, organization, options=None):
+        radiusaccounting_options = _RADACCT.copy()
+        radiusaccounting_options.update(
+            {
+                'organization': organization,
+                'unique_id': '113',
+                'username': user.username,
+            }
+        )
+        options = options or {}
+        radiusaccounting_options.update(options)
+        return super()._create_radius_accounting(**radiusaccounting_options)
+
+    @mock.patch('openwisp_radius.tasks.perform_change_of_authorization.delay')
+    def test_no_change_of_authorization_on_new_radius_user_group(self, mocked_task):
+        # This method creates a new organization user
+        # which has a RadiusUserGroup by default.
+        user = self._get_user_with_org()
+        self.assertEqual(user.radiususergroup_set.count(), 1)
+        mocked_task.assert_not_called()
+
+    @capture_any_output()
+    @mock.patch('openwisp_radius.tasks.perform_change_of_authorization.delay')
+    def test_no_change_of_authorization_on_closed_sessions(self, mocked_task):
+        user = self._get_user_with_org()
+        org = self._get_org()
+        self._create_radius_accounting(
+            user, org, options={'stop_time': '2022-11-04 10:50:00'}
+        )
+        self._change_radius_user_group(user, org)
+        mocked_task.assert_not_called()
+
+    @mock.patch.object(RadClient, 'perform_change_of_authorization', return_value=False)
+    @mock.patch('logging.Logger.warning')
+    def test_perform_change_of_authorization_celery_task_failures(
+        self, mocked_logger, *args
+    ):
+        mocked_user_id = uuid4()
+        mocked_old_group_id = uuid4()
+        mocked_new_group_id = uuid4()
+        org = self._get_org()
+        user = self._get_user_with_org()
+        user_group = RadiusGroup.objects.get(organization=org, name=f'{org.slug}-users')
+        power_user_group = RadiusGroup.objects.get(
+            organization=org, name=f'{org.slug}-power-users'
+        )
+        with self.subTest('Test user deleted after scheduling of task'):
+            perform_change_of_authorization(
+                user_id=mocked_user_id,
+                old_group_id=mocked_old_group_id,
+                new_group_id=mocked_new_group_id,
+            )
+            mocked_logger.assert_called_once_with(
+                f'Failed to find user with "{mocked_user_id}" ID.'
+                ' Skipping CoA operation.'
+            )
+        mocked_logger.reset_mock()
+
+        with self.subTest('Test user session closed after scheduling of task'):
+            perform_change_of_authorization(
+                user_id=user.id,
+                old_group_id=mocked_old_group_id,
+                new_group_id=mocked_new_group_id,
+            )
+            mocked_logger.assert_called_once_with(
+                f'The user with "{user.id}" ID does not have any open'
+                ' RadiusAccounting sessions. Skipping CoA operation.'
+            )
+        mocked_logger.reset_mock()
+
+        session = self._create_radius_accounting(user, org)
+
+        with self.subTest('Test new RadiusGroup was deleted after scheduling of task'):
+            perform_change_of_authorization(
+                user_id=user.id,
+                old_group_id=user_group,
+                new_group_id=mocked_new_group_id,
+            )
+            mocked_logger.assert_called_once_with(
+                f'Failed to find RadiusGroup with "{mocked_new_group_id}".'
+                ' Skipping CoA operation.'
+            )
+        mocked_logger.reset_mock()
+
+        with self.subTest('Test NAS not found for the RadiusAccounting object'):
+            perform_change_of_authorization(
+                user_id=user.id,
+                old_group_id=user_group.id,
+                new_group_id=power_user_group.id,
+            )
+            mocked_logger.assert_called_once_with(
+                f'Failed to find RADIUS secret for "{session.unique_id}"'
+                ' RadiusAccounting object. Skipping CoA operation'
+                ' for this session.'
+            )
+        mocked_logger.reset_mock()
+
+        self._create_nas(
+            name='127.0.0.1',
+            organization=org,
+            short_name='test',
+            type='Virtual',
+            secret='testing123',
+        )
+
+        with self.subTest('Test RadClient encountered error while sending CoA packet'):
+            perform_change_of_authorization(
+                user_id=user.id,
+                old_group_id=user_group.id,
+                new_group_id=power_user_group.id,
+            )
+            mocked_logger.assert_called_once_with(
+                f'Failed to perform CoA for "{session.unique_id}"'
+                f' RadiusAccounting object of "{user}" user'
+            )
+
+    @mock.patch.object(RadClient, 'perform_change_of_authorization', return_value=True)
+    @capture_stderr()
+    def test_change_of_authorization(self, mocked_radclient, *args):
+        org = self._get_org()
+        user = self._get_user_with_org()
+        nas_options = {
+            'organization': org,
+            'short_name': 'test',
+            'type': 'Virtual',
+            'secret': 'testing123',
+        }
+        self._create_nas(name='10.8.0.0/24', **nas_options)
+        self._create_nas(name='172.16.0.0/24', **nas_options)
+        rad_acct = self._create_radius_accounting(
+            user, org, options={'nas_ip_address': '10.8.0.1'}
+        )
+        user_radiususergroup = user.radiususergroup_set.first()
+        restricted_user_group = RadiusGroup.objects.get(
+            organization=org, name=f'{org.slug}-users'
+        )
+        power_user_group = RadiusGroup.objects.get(
+            organization=org, name=f'{org.slug}-power-users'
+        )
+
+        # RadiusGroup is changed to a power user.
+        # Limitations set by the previous RadiusGroup
+        # should be removed.
+        user_radiususergroup.group = power_user_group
+        user_radiususergroup.save()
+        mocked_radclient.assert_called_with(
+            {
+                'User-Name': user.username,
+                'Max-Daily-Session': '',
+                'Max-Daily-Session-Traffic': '',
+            }
+        )
+        rad_acct.refresh_from_db()
+        self.assertEqual(rad_acct.groupname, power_user_group.name)
+
+        mocked_radclient.reset_mock()
+        # RadiusGroup is changed to a restricted user.
+        # Limitations set by the previous RadiusGroup
+        # should be removed.
+        user_radiususergroup.group = restricted_user_group
+        user_radiususergroup.save()
+        mocked_radclient.assert_called_with(
+            {
+                'User-Name': user.username,
+                'Max-Daily-Session': '10800',
+                'Max-Daily-Session-Traffic': '3000000000',
+            }
+        )
+        rad_acct.refresh_from_db()
+        self.assertEqual(rad_acct.groupname, restricted_user_group.name)
+
+    @mock.patch.object(RadClient, 'perform_change_of_authorization')
+    def test_change_of_authorization_org_disabled(self, mocked_radclient):
+        org = self._get_org()
+        org.radius_settings.coa_enabled = False
+        org.radius_settings.save()
+        user = self._get_user_with_org()
+        nas_options = {
+            'organization': org,
+            'short_name': 'test',
+            'type': 'Virtual',
+            'secret': 'testing123',
+        }
+        self._create_nas(name='10.8.0.0/24', **nas_options)
+        self._create_radius_accounting(
+            user, org, options={'nas_ip_address': '10.8.0.1'}
+        )
+        user_radiususergroup = user.radiususergroup_set.first()
+        power_user_group = RadiusGroup.objects.get(
+            organization=org, name=f'{org.slug}-power-users'
+        )
+        user_radiususergroup.group = power_user_group
+        user_radiususergroup.save()
+        mocked_radclient.assert_not_called()

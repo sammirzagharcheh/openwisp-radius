@@ -14,6 +14,8 @@ SECRET_KEY = '&a@f(0@lrl%606smticbu20=pvribdvubk5=gjti8&n1y%bi&4'
 
 ALLOWED_HOSTS = []
 OPENWISP_RADIUS_FREERADIUS_ALLOWED_HOSTS = ['127.0.0.1']
+OPENWISP_RADIUS_COA_ENABLED = True
+OPENWISP_RADIUS_ALLOWED_MOBILE_PREFIXES = ['+44', '+39', '+237', '+595']
 
 INSTALLED_APPS = [
     'django.contrib.auth',
@@ -21,6 +23,7 @@ INSTALLED_APPS = [
     'django.contrib.sessions',
     'django.contrib.messages',
     'django.contrib.staticfiles',
+    'django.contrib.humanize',
     # openwisp admin theme
     'openwisp_utils.admin_theme',
     'openwisp_users.accounts',
@@ -43,6 +46,7 @@ INSTALLED_APPS = [
     'openwisp_radius',
     'openwisp_users',
     # admin
+    'admin_auto_filters',
     'django.contrib.admin',
     'private_storage',
     'drf_yasg',
@@ -55,7 +59,8 @@ LOGIN_REDIRECT_URL = 'admin:index'
 
 AUTHENTICATION_BACKENDS = (
     'openwisp_users.backends.UsersAuthenticationBackend',
-    'djangosaml2.backends.Saml2Backend',
+    'openwisp_radius.saml.backends.OpenwispRadiusSaml2Backend',
+    'sesame.backends.ModelBackend',
 )
 
 AUTH_USER_MODEL = 'openwisp_users.User'
@@ -73,6 +78,7 @@ MIDDLEWARE = [
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
+    'sesame.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
     'djangosaml2.middleware.SamlSessionMiddleware',
@@ -161,7 +167,11 @@ if not TESTING:
 
 if not TESTING and SHELL:
     LOGGING['loggers'] = {
-        'django.db': {'level': 'DEBUG', 'handlers': ['console'], 'propagate': False,},
+        'django.db': {
+            'level': 'DEBUG',
+            'handlers': ['console'],
+            'propagate': False,
+        },
         '': {
             # this sets root level logger to log debug and higher level
             # logs to console. All other loggers inherit settings from
@@ -177,8 +187,8 @@ AUTH_PASSWORD_VALIDATORS = []
 
 LANGUAGE_CODE = 'en-gb'
 TIME_ZONE = 'America/Asuncion'  # used to replicate timezone related bug, do not change!
-USE_I18N = False
-USE_L10N = False
+USE_I18N = True
+USE_L10N = True
 USE_TZ = True
 MEDIA_ROOT = os.path.join(BASE_DIR, 'media')
 PRIVATE_STORAGE_ROOT = os.path.join(MEDIA_ROOT, 'private')
@@ -204,7 +214,7 @@ SOCIALACCOUNT_PROVIDERS = {
 redis_host = os.getenv('REDIS_HOST', 'localhost')
 
 OPENWISP_RADIUS_PASSWORD_RESET_URLS = {
-    'default': (
+    '__all__': (
         'http://localhost:8080/{organization}/password/reset/confirm/{uid}/{token}'
     ),
 }
@@ -215,6 +225,7 @@ else:
     OPENWISP_RADIUS_GROUPCHECK_ADMIN = True
     OPENWISP_RADIUS_GROUPREPLY_ADMIN = True
     OPENWISP_RADIUS_USERGROUP_ADMIN = True
+    OPENWISP_RADIUS_USER_ADMIN_RADIUSTOKEN_INLINE = True
     CELERY_TASK_ALWAYS_EAGER = True
     CELERY_TASK_EAGER_PROPAGATES = True
     CELERY_BROKER_URL = 'memory://'
@@ -269,10 +280,10 @@ ACCOUNT_EMAIL_CONFIRMATION_ANONYMOUS_REDIRECT_URL = 'email_confirmation_success'
 ACCOUNT_EMAIL_CONFIRMATION_AUTHENTICATED_REDIRECT_URL = 'email_confirmation_success'
 
 # OPENWISP_RADIUS_PASSWORD_RESET_URLS = {
-#     # fallback in case the specific org page is not defined
-#     'default': 'https://example.com/{{organization}/password/reset/confirm/{uid}/{token},
 #     # use the uuid because the slug can change
 #     # 'dabbd57a-11ca-4277-8dbb-ad21057b5ecd': 'https://org.com/{organization}/password/reset/confirm/{uid}/{token}',
+#     # fallback in case the specific org page is not defined
+#     '__all__': 'https://example.com/{{organization}/password/reset/confirm/{uid}/{token}',
 # }
 
 if TESTING:
@@ -295,6 +306,7 @@ if os.environ.get('SAMPLE_APP', False):
     OPENWISP_USERS_ORGANIZATION_MODEL = 'sample_users.Organization'
     OPENWISP_USERS_ORGANIZATIONUSER_MODEL = 'sample_users.OrganizationUser'
     OPENWISP_USERS_ORGANIZATIONOWNER_MODEL = 'sample_users.OrganizationOwner'
+    OPENWISP_USERS_ORGANIZATIONINVITATION_MODEL = 'sample_users.OrganizationInvitation'
     OPENWISP_RADIUS_RADIUSREPLY_MODEL = 'sample_radius.RadiusReply'
     OPENWISP_RADIUS_RADIUSGROUPREPLY_MODEL = 'sample_radius.RadiusGroupReply'
     OPENWISP_RADIUS_RADIUSCHECK_MODEL = 'sample_radius.RadiusCheck'

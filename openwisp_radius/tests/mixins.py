@@ -3,7 +3,7 @@ import os
 import swapper
 from django.conf import settings
 from django.contrib.auth import get_user_model
-from django.test import TestCase
+from django.test import TestCase, TransactionTestCase
 from django.urls import reverse
 
 from openwisp_utils.tests import AssertNumQueriesSubTestMixin
@@ -18,6 +18,7 @@ RadiusBatch = load_model('RadiusBatch')
 RadiusToken = load_model('RadiusToken')
 Organization = swapper.load_model('openwisp_users', 'Organization')
 OrganizationRadiusSettings = load_model('OrganizationRadiusSettings')
+RadiusUserGroup = load_model('RadiusUserGroup')
 
 
 class GetEditFormInlineMixin(object):
@@ -92,6 +93,11 @@ class GetEditFormInlineMixin(object):
                 'registered_user-INITIAL_FORMS': 0,
                 'registered_user-MIN_NUM_FORMS': 0,
                 'registered_user-MAX_NUM_FORMS': 0,
+                # radius token inline
+                'radius_token-TOTAL_FORMS': '0',
+                'radius_token-INITIAL_FORMS': '0',
+                'radius_token-MIN_NUM_FORMS': '0',
+                'radius_token-MAX_NUM_FORMS': '1',
             }
         )
         return params
@@ -141,7 +147,10 @@ class ApiTokenMixin(BasePostParamsMixin):
         }
         if extra_params:
             params.update(extra_params)
-        response = self.client.post(url, params,)
+        response = self.client.post(
+            url,
+            params,
+        )
         if expect_201:
             self.assertEqual(response.status_code, 201)
         return response
@@ -178,7 +187,8 @@ class ApiTokenMixin(BasePostParamsMixin):
                 HTTP_AUTHORIZATION=auth_header,
             )
         return self.client.post(
-            reverse('radius:authorize'), {'username': username, 'password': password},
+            reverse('radius:authorize'),
+            {'username': username, 'password': password},
         )
 
     def _login_and_obtain_auth_token(self, username='tester', password='tester'):
@@ -188,7 +198,7 @@ class ApiTokenMixin(BasePostParamsMixin):
         return login_response.json()['radius_user_token']
 
 
-class BaseTestCase(AssertNumQueriesSubTestMixin, DefaultOrgMixin, TestCase):
+class BaseTestMixin:
     @classmethod
     def setUpClass(cls):
         super().setUpClass()
@@ -201,3 +211,15 @@ class BaseTestCase(AssertNumQueriesSubTestMixin, DefaultOrgMixin, TestCase):
     def _superuser_login(self):
         admin = self._get_admin()
         self.client.force_login(admin)
+
+
+class BaseTestCase(
+    BaseTestMixin, AssertNumQueriesSubTestMixin, DefaultOrgMixin, TestCase
+):
+    pass
+
+
+class BaseTransactionTestCase(
+    BaseTestMixin, AssertNumQueriesSubTestMixin, DefaultOrgMixin, TransactionTestCase
+):
+    pass

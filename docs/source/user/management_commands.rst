@@ -1,3 +1,5 @@
+.. _management_commands:
+
 ===================
 Management commands
 ===================
@@ -64,7 +66,7 @@ For example:
 ----------------------------
 
 .. note::
-  `Find out more about this feature in its dedicated page <./generating_users.html>`_
+  :ref:`Find out more about this feature in its dedicated page <generating_users>`
 
 This command deactivates expired user accounts which were created temporarily
 (eg: for en event) and have an expiration date set.
@@ -89,7 +91,10 @@ Note that the default duration is set to 18 months.
 ---------------------------
 
 This command deletes unverified users that have been registered for
-more than specified duration.
+more than specified duration and have no associated radius session.
+This feature is needed to delete users who have registered but never
+completed the verification process.
+**Staff users will not be deleted by this management command.**
 
 .. code-block:: shell
 
@@ -105,7 +110,7 @@ You can specify multiple methods separated by comma(`,`). Following is an exampl
     ./manage.py delete_unverified_users --older-than-days 1 --exclude-methods mobile_phone,email
 
 ``upgrade_from_django_freeradius``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+----------------------------------
 
 If you are upgrading from `django-freeradius <https://github.com/openwisp/django-freeradius>`_
 to openwisp-radius, there is an easy migration script that will import your freeradius
@@ -131,11 +136,14 @@ by default the data is added to the first found organization, eg::
 .. warning::
     It is not possible to export user credential data for radiusbatch created using prefix, please manually preserve the PDF files if you want to access the data in the future.
 
+.. _convert_called_station_id:
+
 ``convert_called_station_id``
-^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+-----------------------------
 
 If an installation uses a centralized captive portal, the value of "Called Station ID" of
-RADIUS Session will show the MAC address of the captive portal instead of access points.
+RADIUS Sessions will always show the MAC address of the captive portal instead of the access points.
+
 This command will update the "Called Station ID" to reflect the MAC address of the access points
 using information from OpenVPN. It requires installing ``openvpn_status``,
 which can be installed using the following command
@@ -145,7 +153,7 @@ which can be installed using the following command
     pip install openwisp-radius[openvpn_status]
 
 In order to work, this command requires to be configured via the
-`OPENWISP_RADIUS_CALLED_STATION_IDS <./settings.html#openwisp-radius-called-station-ids>`_ setting.
+:ref:`OPENWISP_RADIUS_CALLED_STATION_IDS <openwisp_radius_called_station_ids>` setting.
 
 Use the following command if you want to perform this operation for all
 RADIUS sessions that meet criteria of ``OPENWISP_RADIUS_CALLED_STATION_IDS``
@@ -165,7 +173,7 @@ replacing session's ``unique_id`` in the following command:
 .. note::
 
     If you encounter ``ParseError`` for datetime data, you can set the datetime format
-    of the parser using `OPENWISP_RADIUS_OPENVPN_DATETIME_FORMAT <./settings.html#openwisp-radius-openvpn-datetime-format>`_
+    of the parser using :ref:`OPENWISP_RADIUS_OPENVPN_DATETIME_FORMAT <openwisp_radius_openvpn_datetime_format>`
     setting.
 
 .. note::

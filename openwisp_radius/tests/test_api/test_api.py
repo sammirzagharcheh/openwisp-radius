@@ -172,7 +172,6 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertIn('username', response.data)
         self.assertIn('email', response.data)
 
-    @mock.patch('openwisp_radius.settings.ALLOWED_MOBILE_PREFIXES', ['+33'])
     def test_register_duplicate_different_org(self):
         self.default_org.radius_settings.sms_verification = True
         self.default_org.radius_settings.save()
@@ -183,7 +182,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         params = {
             'username': self._test_email,
             'email': self._test_email,
-            'phone_number': '+33675579231',
+            'phone_number': '+393664255803',
             'password1': 'password',
             'password2': 'password',
         }
@@ -200,7 +199,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
 
         with self.subTest('Test existing email'):
             options = params.copy()
-            options['phone_number'] = '+33675579231'
+            options['phone_number'] = '+393664255803'
             options['username'] = 'test2'
 
             response = self.client.post(url, data=options)
@@ -248,6 +247,52 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             self.assertDictEqual(response.data, expected_response_data)
             self.assertEqual(User.objects.count(), init_user_count + 1)
             self.assertEqual(OrganizationUser.objects.count(), org_user_count + 1)
+
+        with self.subTest('Test multiple existing accounts'):
+            # Tests if user provide registration information that
+            # belongs to two different accounts.
+            # Create a second user that has different email and username
+            test_user2 = self._create_user(
+                username='test_user2@example.com',
+                email='test_user2@example.com',
+            )
+            OrganizationUser.objects.create(
+                user=test_user2, organization=self.default_org
+            )
+            # User combination of username, email and phone number
+            # of both users that were previously created.
+            params = {
+                'username': test_user2.username,
+                'email': test_user2.email,
+                'phone_number': '+393664255803',
+                'password1': 'password',
+                'password2': 'password',
+            }
+            response = self.client.post(url, data=params)
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(User.objects.count(), init_user_count + 2)
+            self.assertEqual(OrganizationUser.objects.count(), org_user_count + 2)
+
+        with self.subTest('Test user already registered with organization'):
+            # Make test_user2 member of org2.
+            # The query will give preference to phone_number which
+            # will return HTTP 409 response. But since the other
+            # information belongs to an user which already has account
+            # with this organization, it should return HTTP 400.
+            OrganizationUser.objects.create(user=test_user2, organization=org2)
+            # User combination of username, email and phone number
+            # of both users that were previously created.
+            params = {
+                'username': test_user2.username,
+                'email': test_user2.email,
+                'phone_number': '+393664255803',
+                'password1': 'password',
+                'password2': 'password',
+            }
+            response = self.client.post(url, data=params)
+            self.assertEqual(response.status_code, 400)
+            self.assertEqual(User.objects.count(), init_user_count + 2)
+            self.assertEqual(OrganizationUser.objects.count(), org_user_count + 3)
 
         self.default_org.radius_settings.sms_verification = False
         self.default_org.radius_settings.save()
@@ -507,7 +552,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response_json = json.loads(response.content)
         org = Organization.objects.get(pk=response_json['organization'])
         pdf_url = reverse(
-            'radius:download_rad_batch_pdf', args=[org.slug, response_json['id']],
+            'radius:download_rad_batch_pdf',
+            args=[org.slug, response_json['id']],
         )
         self._superuser_login()
         self.assertEqual(response_json['pdf_link'], None)
@@ -528,7 +574,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             name='test', strategy='prefix', prefix='test-prefix5'
         )
         url = reverse(
-            'radius:download_rad_batch_pdf', args=['non-existent-org', radbatch.pk],
+            'radius:download_rad_batch_pdf',
+            args=['non-existent-org', radbatch.pk],
         )
         self._superuser_login()
         response = self.client.get(url)
@@ -540,7 +587,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             name='test', strategy='prefix', prefix='test-prefix5', organization=org2
         )
         url = reverse(
-            'radius:download_rad_batch_pdf', args=[self.default_org.slug, radbatch.pk],
+            'radius:download_rad_batch_pdf',
+            args=[self.default_org.slug, radbatch.pk],
         )
         operator = self._get_operator()
         self._create_org_user(user=operator)
@@ -551,7 +599,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
     @capture_any_output()
     def test_api_password_change(self):
         test_user = User.objects.create_user(
-            username='test_name', password='test_password',
+            username='test_name',
+            password='test_password',
         )
         self._create_org_user(organization=self.default_org, user=test_user)
         login_payload = {'username': 'test_name', 'password': 'test_password'}
@@ -564,7 +613,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
 
         # invalid organization
         password_change_url = reverse(
-            'radius:rest_password_change', args=['random-valid-slug'],
+            'radius:rest_password_change',
+            args=['random-valid-slug'],
         )
         new_password_payload = {
             'current_password': 'test_password',
@@ -599,7 +649,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = client.post(password_change_url, data=new_password_payload)
         self.assertEqual(response.status_code, 400)
         self.assertIn(
-            'New password and Confirm password do not match.',
+            'The two password fields didn’t match.',
             str(response.data['confirm_password']),
         )
 
@@ -616,7 +666,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = client.post(password_change_url, data=new_password_payload)
         self.assertEqual(response.status_code, 400)
         self.assertIn(
-            'Current password was entered incorrectly. Please enter it again.',
+            'Your old password was entered incorrectly. Please enter it again.',
             str(response.data['current_password']),
         )
 
@@ -633,7 +683,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         response = client.post(password_change_url, data=new_password_payload)
         self.assertEqual(response.status_code, 400)
         self.assertIn(
-            'New Password and Current Password cannot be same.',
+            'New password cannot be the same as your old password.',
             str(response.data['new_password']),
         )
 
@@ -663,9 +713,13 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(response.status_code, 401)
 
     @capture_any_output()
+    @mock.patch('openwisp_users.settings.AUTH_BACKEND_AUTO_PREFIXES', ['+39'])
     def test_api_password_reset(self):
         test_user = User.objects.create_user(
-            username='test_name', password='test_password', email='test@email.com'
+            username='test_name',
+            password='test_password',
+            email='test@email.com',
+            phone_number='+393664255803',
         )
         self._create_org_user(organization=self.default_org, user=test_user)
         mail_count = len(mail.outbox)
@@ -687,7 +741,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(response.status_code, 400)
 
         # email does not exist in database
-        reset_payload = {'email': 'wrong@email.com'}
+        reset_payload = {'input': 'wrong@email.com'}
         response = self.client.post(password_reset_url, data=reset_payload)
         self.assertEqual(response.status_code, 404)
 
@@ -695,15 +749,24 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         User.objects.create_user(
             username='test_name1', password='test_password', email='test1@email.com'
         )
-        reset_payload = {'email': 'test1@email.com'}
+        reset_payload = {'input': 'test1@email.com'}
         response = self.client.post(password_reset_url, data=reset_payload)
         self.assertEqual(response.status_code, 400)
 
         # valid payload
-        reset_payload = {'email': 'test@email.com'}
+        reset_payload = {'input': 'test@email.com'}
         response = self.client.post(password_reset_url, data=reset_payload)
         self.assertEqual(len(mail.outbox), mail_count + 1)
-
+        email = mail.outbox.pop()
+        self.assertIn(
+            "<p> Please click on the button below to open a page where you can",
+            ' '.join(email.alternatives[0][0].split()),
+        )
+        self.assertRegex(
+            ''.join(email.alternatives[0][0].splitlines()),
+            '<a href=".*">.*Reset password.*<\/a>',
+        )
+        self.assertNotIn('<img src=""', email.alternatives[0][0])
         url_kwargs = {
             'uid': user_pk_to_url_str(test_user),
             'token': default_token_generator.make_token(test_user),
@@ -766,6 +829,29 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         login_response = self.client.post(login_url, data=login_payload)
         self.assertEqual(login_response.status_code, 200)
 
+        with self.subTest('Test reset password with username'):
+            reset_payload = {'input': test_user.username}
+            response = self.client.post(password_reset_url, data=reset_payload)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(mail.outbox), mail_count + 1)
+            mail.outbox.pop()
+
+        with self.subTest('Test reset password with phone_number'):
+            reset_payload = {'input': test_user.phone_number}
+            response = self.client.post(password_reset_url, data=reset_payload)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(mail.outbox), mail_count + 1)
+            mail.outbox.pop()
+
+        with self.subTest(
+            'Test reset password with phone_number without country prefix'
+        ):
+            reset_payload = {'input': test_user.phone_number.national_number}
+            response = self.client.post(password_reset_url, data=reset_payload)
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(mail.outbox), mail_count + 1)
+            mail.outbox.pop()
+
     def test_api_password_reset_405(self):
         password_reset_url = reverse(
             'radius:rest_password_reset', args=[self.default_org.slug]
@@ -818,7 +904,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self._create_radius_accounting(**data3)
         url = reverse('radius:user_accounting', args=[self.default_org.slug])
         response = self.client.get(
-            f'{url}?page_size=1&page=1', HTTP_AUTHORIZATION=authorization,
+            f'{url}?page_size=1&page=1',
+            HTTP_AUTHORIZATION=authorization,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -829,7 +916,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(item['calling_station_id'], '5c:7d:c1:72:a7:3b')
         self.assertIsNone(item['stop_time'])
         response = self.client.get(
-            f'{url}?page_size=1&page=2', HTTP_AUTHORIZATION=authorization,
+            f'{url}?page_size=1&page=2',
+            HTTP_AUTHORIZATION=authorization,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -840,7 +928,8 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(item['called_station_id'], '00-27-22-F3-FA-F1:hostname')
         self.assertIsNotNone(item['stop_time'])
         response = self.client.get(
-            f'{url}?page_size=1&page=3', HTTP_AUTHORIZATION=authorization,
+            f'{url}?page_size=1&page=3',
+            HTTP_AUTHORIZATION=authorization,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 404)
@@ -856,7 +945,7 @@ class TestApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         org = self._get_org()
         self._create_org_user(user=user, organization=org)
         path = reverse('radius:rest_password_reset', args=[org.slug])
-        r = self.client.post(path, {'email': user.email})
+        r = self.client.post(path, {'input': user.email})
         self.assertEqual(r.status_code, 200)
         self.assertEqual(r.data['detail'], 'Password reset e-mail has been sent.')
         mocked_send.assert_called_once()

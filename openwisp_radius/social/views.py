@@ -7,7 +7,7 @@ from django.views import View
 from rest_framework.authtoken.models import Token
 
 from ..api.views import RadiusTokenMixin
-from ..utils import load_model
+from ..utils import get_organization_radius_settings, load_model
 
 Organization = swapper.load_model('openwisp_users', 'Organization')
 RadiusToken = load_model('RadiusToken')
@@ -33,6 +33,9 @@ class RedirectCaptivePageView(RadiusTokenMixin, View):
         authorization logic
         raises PermissionDenied if user is not authorized
         """
+        if not get_organization_radius_settings(org, 'social_registration_enabled'):
+            raise PermissionDenied
+
         user = request.user
         if not user.is_authenticated or not user.socialaccount_set.exists():
             raise PermissionDenied()

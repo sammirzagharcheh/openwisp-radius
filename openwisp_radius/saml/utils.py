@@ -1,4 +1,7 @@
+import logging
 from urllib.parse import urlparse
+
+logger = logging.getLogger()
 
 
 def get_url_or_path(url):

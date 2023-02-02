@@ -3,12 +3,9 @@ import ipaddress
 import json
 import logging
 import os
-from base64 import encodebytes
+import string
 from datetime import timedelta
-from hashlib import md5, sha1
 from io import StringIO
-from os import urandom
-from urllib.parse import urljoin
 
 import phonenumbers
 import swapper
@@ -18,17 +15,15 @@ from django.core.cache import cache
 from django.core.exceptions import ObjectDoesNotExist, ValidationError
 from django.core.mail import send_mail
 from django.db import models
-from django.db.models import Count, ProtectedError
+from django.db.models import ProtectedError, Q
 from django.utils import timezone
 from django.utils.crypto import get_random_string
 from django.utils.timezone import now
 from django.utils.translation import gettext_lazy as _
 from jsonfield import JSONField
 from model_utils.fields import AutoLastModifiedField
-from passlib.hash import lmhash, nthash, sha512_crypt
 from phonenumber_field.modelfields import PhoneNumberField
 from private_storage.fields import PrivateFileField
-from private_storage.storage.files import PrivateFileSystemStorage
 
 from openwisp_radius.registration import REGISTRATION_METHOD_CHOICES
 from openwisp_users.mixins import OrgMixin
@@ -41,6 +36,7 @@ from ..settings import (
     BATCH_MAIL_MESSAGE,
     BATCH_MAIL_SENDER,
     BATCH_MAIL_SUBJECT,
+    DEFAULT_PASSWORD_RESET_URL,
 )
 from ..utils import (
     SmsMessage,
@@ -51,7 +47,13 @@ from ..utils import (
     prefix_generate_users,
     validate_csvfile,
 )
-from .validators import ipv6_network_validator
+from .fields import (
+    FallbackBooleanChoiceField,
+    FallbackCharChoiceField,
+    FallbackCharField,
+    FallbackTextField,
+)
+from .validators import ipv6_network_validator, password_reset_url_validator
 
 logger = logging.getLogger(__name__)
 User = get_user_model()
@@ -126,22 +128,6 @@ RAD_NAS_TYPES = app_settings.EXTRA_NAS_TYPES + (
     ('Other', 'Other'),
 )
 RADOP_REPLY_TYPES = (('=', '='), (':=', ':='), ('+=', '+='))
-RADCHECK_ATTRIBUTE_TYPES = [
-    'Max-Daily-Session',
-    'Max-All-Session',
-    'Max-Daily-Session-Traffic',
-]
-RADCHECK_PASSWD_TYPE = [
-    'Cleartext-Password',
-    'NT-Password',
-    'LM-Password',
-    'MD5-Password',
-    'SMD5-Password',
-    'SHA-Password',
-    'SSHA-Password',
-    'Crypt-Password',
-]
-RADCHECK_ATTRIBUTE_TYPES += RADCHECK_PASSWD_TYPE
 _STRATEGIES = (('prefix', _('Generate from prefix')), ('csv', _('Import from CSV')))
 _NOT_BLANK_MESSAGE = _('This field cannot be blank.')
 _GET_IP_LIST_HELP_TEXT = _(
@@ -158,10 +144,25 @@ _GET_OPTIONAL_FIELDS_HELP_TEXT = _(
 _REGISTRATION_ENABLED_HELP_TEXT = _(
     'Whether the registration API endpoint should be enabled or not'
 )
+_SAML_REGISTRATION_ENABLED_HELP_TEXT = _(
+    'Whether the registration using SAML should be enabled or not'
+)
+_SOCIAL_REGISTRATION_ENABLED_HELP_TEXT = _(
+    'Whether the registration using social applications should be enabled or not'
+)
+_SMS_VERIFICATION_HELP_TEXT = _(
+    'Whether users who sign up should be required to verify their mobile '
+    'phone number via SMS'
+)
 _ORGANIZATION_HELP_TEXT = _('The user is not a member of this organization')
 _IDENTITY_VERIFICATION_ENABLED_HELP_TEXT = _(
     'Whether identity verification is required at the time of user registration'
 )
+_COA_ENABLED_HELP_TEXT = _('Whether RADIUS Change Of Authoization (CoA) is enabled')
+_LOGIN_URL_HELP_TEXT = _('Enter the URL where users can log in to the wifi service')
+_STATUS_URL_HELP_TEXT = _('Enter the URL where users can log out from the wifi service')
+_PASSWORD_RESET_URL_HELP_TEXT = _('Enter the URL where users can reset their password')
+OPTIONAL_SETTINGS = app_settings.OPTIONAL_REGISTRATION_FIELDS
 
 
 class AutoUsernameMixin(object):
@@ -186,6 +187,7 @@ class AutoUsernameMixin(object):
             raise ValidationError(
                 {'username': _NOT_BLANK_MESSAGE, 'user': _NOT_BLANK_MESSAGE}
             )
+        return super().clean()
 
 
 class AutoGroupnameMixin(object):
@@ -202,76 +204,64 @@ class AutoGroupnameMixin(object):
             )
 
 
-class AbstractRadiusCheckQueryset(models.query.QuerySet):
-    def filter_duplicate_username(self):
-        pks = []
-        for i in (
-            self.values('username')
-            .annotate(Count('id'))
-            .order_by()
-            .filter(id__count__gt=1)
+class AttributeValidationMixin(object):
+    def _get_validation_queryset_kwargs(self):
+        raise NotImplementedError
+
+    def _get_error_message(self):
+        raise NotImplementedError
+
+    @property
+    def _object_name(self):
+        return (
+            type(self).__name__.lower().replace('radius', '').replace('group', 'group ')
+        )
+
+    def clean(self):
+        """
+        checks if the check or reply attribute is unique
+        """
+        model = type(self).__name__
+        if (
+            load_model(model)
+            .objects.filter(**self._get_validation_queryset_kwargs())
+            .exclude(pk=self.pk)
+            .exists()
         ):
-            pks.extend([account.pk for account in self.filter(username=i['username'])])
-        return self.filter(pk__in=pks)
-
-    def filter_duplicate_value(self):
-        pks = []
-        for i in (
-            self.values('value')
-            .annotate(Count('id'))
-            .order_by()
-            .filter(id__count__gt=1)
-        ):
-            pks.extend([accounts.pk for accounts in self.filter(value=i['value'])])
-        return self.filter(pk__in=pks)
-
-    def filter_expired(self):
-        return self.filter(valid_until__lt=now())
-
-    def filter_not_expired(self):
-        return self.filter(valid_until__gte=now())
+            raise ValidationError({'attribute': self._get_error_message()})
+        return super().clean()
 
 
-def _encode_secret(attribute, new_value=None):
-    if attribute == 'NT-Password':
-        attribute_value = nthash.hash(new_value)
-    elif attribute == 'LM-Password':
-        attribute_value = lmhash.hash(new_value)
-    elif attribute == 'MD5-Password':
-        attribute_value = md5(new_value.encode('utf-8')).hexdigest()
-    elif attribute == 'SMD5-Password':
-        salt = urandom(4)
-        hash = md5(new_value.encode('utf-8'))
-        hash.update(salt)
-        hash_encoded = encodebytes(hash.digest() + salt)
-        attribute_value = hash_encoded.decode('utf-8')[:-1]
-    elif attribute == 'SHA-Password':
-        attribute_value = sha1(new_value.encode('utf-8')).hexdigest()
-    elif attribute == 'SSHA-Password':
-        salt = urandom(4)
-        hash = sha1(new_value.encode('utf-8'))
-        hash.update(salt)
-        hash_encoded = encodebytes(hash.digest() + salt)
-        attribute_value = hash_encoded.decode('utf-8')[:-1]
-    elif attribute == 'Crypt-Password':
-        attribute_value = sha512_crypt.hash(new_value)
-    else:
-        attribute_value = new_value
-    return attribute_value
+class UserAttributeValidationMixin(AttributeValidationMixin):
+    def _get_validation_queryset_kwargs(self):
+        kwargs = dict(user=self.user, attribute=self.attribute)
+        org = getattr(self, 'organization', None)
+        # only add `organization` key if it exists
+        if org:
+            kwargs['organization'] = org
+        return kwargs
+
+    def _get_error_message(self):
+        return _(
+            'Another %(object_name)s for the same user and with '
+            'the same attribute already exists.'
+        ) % {'object_name': self._object_name}
 
 
-class AbstractRadiusCheckManager(models.Manager):
-    def get_queryset(self):
-        return AbstractRadiusCheckQueryset(self.model, using=self._db)
+class GroupAttributeValidationMixin(AttributeValidationMixin):
+    def _get_validation_queryset_kwargs(self):
+        return dict(group=self.group, attribute=self.attribute)
 
-    def create(self, *args, **kwargs):
-        if 'new_value' in kwargs:
-            kwargs['value'] = _encode_secret(kwargs['attribute'], kwargs['new_value'])
-            del kwargs['new_value']
-        return super(AbstractRadiusCheckManager, self).create(*args, **kwargs)
+    def _get_error_message(self):
+        return _(
+            'Another %(object_name)s for the same group and with '
+            'the same attribute already exists.'
+        ) % {'object_name': self._object_name}
 
 
-class AbstractRadiusCheck(OrgMixin, AutoUsernameMixin, TimeStampedEditableModel):
+class AbstractRadiusCheck(
+    OrgMixin, AutoUsernameMixin, UserAttributeValidationMixin, TimeStampedEditableModel
+):
     username = models.CharField(
         verbose_name=_('username'),
         max_length=64,
@@ -291,24 +281,11 @@ class AbstractRadiusCheck(OrgMixin, AutoUsernameMixin, TimeStampedEditableModel)
     attribute = models.CharField(
         verbose_name=_('attribute'),
         max_length=64,
-        choices=[
-            (i, i)
-            for i in RADCHECK_ATTRIBUTE_TYPES
-            if i not in app_settings.DISABLED_SECRET_FORMATS
-        ],
-        default=app_settings.DEFAULT_SECRET_FORMAT,
     )
     # the foreign key is not part of the standard freeradius schema
     user = models.ForeignKey(
         settings.AUTH_USER_MODEL, on_delete=models.CASCADE, blank=True, null=True
     )
-    # additional fields to enable more granular checks
-    is_active = models.BooleanField(default=True)
-    valid_until = models.DateTimeField(null=True, blank=True)
-    # internal notes
-    notes = models.TextField(null=True, blank=True)
-    # custom manager
-    objects = AbstractRadiusCheckManager()
 
     class Meta:
         db_table = 'radcheck'
@@ -320,7 +297,9 @@ class AbstractRadiusCheck(OrgMixin, AutoUsernameMixin, TimeStampedEditableModel)
         return self.username
 
 
-class AbstractRadiusReply(OrgMixin, AutoUsernameMixin, TimeStampedEditableModel):
+class AbstractRadiusReply(
+    OrgMixin, AutoUsernameMixin, UserAttributeValidationMixin, TimeStampedEditableModel
+):
     username = models.CharField(
         verbose_name=_('username'),
         max_length=64,
@@ -540,6 +519,28 @@ class AbstractRadiusAccounting(OrgMixin, models.Model):
     def __str__(self):
         return self.unique_id
 
+    @classmethod
+    def close_stale_sessions(cls, days):
+        older_than = timezone.now() - timedelta(days=days)
+        # If the "update_time" is recent, then the session is not closed
+        # even when the "start_time" is older than the specified time.
+        # The "start_time" of a session is only checked when the
+        # "update_time" is not set.
+        sessions = cls.objects.filter(
+            Q(stop_time__isnull=True)
+            & (
+                Q(update_time__lt=older_than)
+                | (Q(update_time=None) & Q(start_time__lt=older_than))
+            )
+        )
+        for session in sessions:
+            # calculate seconds in between two dates
+            session.session_time = (now() - session.start_time).total_seconds()
+            session.stop_time = now()
+            session.update_time = session.stop_time
+            session.terminate_cause = 'Session Timeout'
+            session.save()
+
 
 class AbstractNas(OrgMixin, TimeStampedEditableModel):
     name = models.CharField(
@@ -711,7 +712,9 @@ class AbstractRadiusUserGroup(
         return str(self.username)
 
 
-class AbstractRadiusGroupCheck(AutoGroupnameMixin, TimeStampedEditableModel):
+class AbstractRadiusGroupCheck(
+    AutoGroupnameMixin, GroupAttributeValidationMixin, TimeStampedEditableModel
+):
     groupname = models.CharField(
         verbose_name=_('group name'),
         max_length=64,
@@ -744,7 +747,9 @@ class AbstractRadiusGroupCheck(AutoGroupnameMixin, TimeStampedEditableModel):
         return str(self.groupname)
 
 
-class AbstractRadiusGroupReply(AutoGroupnameMixin, TimeStampedEditableModel):
+class AbstractRadiusGroupReply(
+    AutoGroupnameMixin, GroupAttributeValidationMixin, TimeStampedEditableModel
+):
     groupname = models.CharField(
         verbose_name=_('group name'),
         max_length=64,
@@ -808,14 +813,14 @@ class AbstractRadiusPostAuth(OrgMixin, UUIDModel):
         return str(self.username)
 
 
-_get_csv_file_private_storage = PrivateFileSystemStorage(
-    location=settings.PRIVATE_STORAGE_ROOT,
-    base_url=urljoin(app_settings.RADIUS_API_BASEURL, app_settings.CSV_URL_PATH),
-)
-
-
 def _get_csv_file_location(instance, filename):
-    return os.path.join(str(instance.organization.pk), filename)
+    return os.path.join(
+        str(instance.organization.slug),
+        'batch',
+        str(instance.organization.pk),
+        'csv',
+        filename,
+    )
 
 
 class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
@@ -843,7 +848,7 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
         null=True,
         blank=True,
         verbose_name='CSV',
-        storage=_get_csv_file_private_storage,
+        storage=app_settings.PRIVATE_STORAGE_INSTANCE,
         upload_to=_get_csv_file_location,
         help_text=_('The csv file containing the user details to be uploaded'),
         max_file_size=app_settings.MAX_CSV_FILE_SIZE,
@@ -856,7 +861,11 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
         help_text=_('Usernames generated will be of the format [prefix][number]'),
     )
     # List of usernames and passwords used to create PDF
-    user_credentials = JSONField(null=True, blank=True, verbose_name='PDF',)
+    user_credentials = JSONField(
+        null=True,
+        blank=True,
+        verbose_name='PDF',
+    )
     expiration_date = models.DateField(
         verbose_name=_('expiration date'),
         null=True,
@@ -883,6 +892,19 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
             raise ValidationError(
                 {'prefix': _('This field cannot be blank.')}, code='invalid'
             )
+        if self.strategy == 'prefix' and self.prefix:
+            valid_chars = string.ascii_letters + string.digits + "@.+-_"
+            for char in self.prefix:
+                if char not in valid_chars:
+                    raise ValidationError(
+                        {
+                            'prefix': _(
+                                'This value may contain only \
+                        letters, numbers, and @/./+/-/_ characters.'
+                            )
+                        },
+                        code='invalid',
+                    )
         if (
             self.strategy == 'csv'
             and self.prefix
@@ -969,7 +991,12 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
 
     def save_user(self, user):
         OrganizationUser = swapper.load_model('openwisp_users', 'OrganizationUser')
+        RegisteredUser = swapper.load_model('openwisp_radius', 'RegisteredUser')
         user.save()
+        registered_user = RegisteredUser(user=user, method='manual')
+        if self.organization.radius_settings.get_setting('needs_identity_verification'):
+            registered_user.is_verified = True
+        registered_user.save()
         self.users.add(user)
         if OrganizationUser.objects.filter(
             user=user, organization=self.organization
@@ -994,9 +1021,7 @@ class AbstractRadiusBatch(OrgMixin, TimeStampedEditableModel):
 
     def _remove_files(self):
         if self.csvfile:
-            path = self.csvfile.path
-            if os.path.isfile(path):
-                os.remove(path)
+            self.csvfile.storage.delete(self.csvfile.name)
 
 
 class AbstractRadiusToken(OrgMixin, TimeStampedEditableModel, models.Model):
@@ -1035,7 +1060,10 @@ class AbstractRadiusToken(OrgMixin, TimeStampedEditableModel, models.Model):
         return get_random_string(length=40)
 
     def __str__(self):
-        return self.key
+        # When the object is deleted, the key is set to None.
+        # This raises error when deleting the object from
+        # UserAdmin.
+        return self.key or f'RadiusToken: {self.user.username}'
 
 
 class AbstractOrganizationRadiusSettings(UUIDModel):
@@ -1046,19 +1074,19 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
         on_delete=models.CASCADE,
     )
     token = KeyField(max_length=32)
-    sms_verification = models.BooleanField(
-        default=app_settings.SMS_DEFAULT_VERIFICATION,
-        help_text=_(
-            'whether users who sign up should '
-            'be required to verify their mobile '
-            'phone number via SMS'
-        ),
+    sms_verification = FallbackBooleanChoiceField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_SMS_VERIFICATION_HELP_TEXT,
+        fallback=app_settings.SMS_VERIFICATION_ENABLED,
     )
-    needs_identity_verification = models.BooleanField(
+    needs_identity_verification = FallbackBooleanChoiceField(
         null=True,
         blank=True,
         default=None,
         help_text=_IDENTITY_VERIFICATION_ENABLED_HELP_TEXT,
+        fallback=app_settings.NEEDS_IDENTITY_VERIFICATION,
     )
     sms_sender = models.CharField(
         _('Sender'),
@@ -1069,6 +1097,17 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
             'alpha numeric identifier used as sender for SMS sent by this organization'
         ),
     )
+    sms_message = FallbackTextField(
+        _('SMS Message'),
+        max_length=160,
+        blank=True,
+        null=True,
+        help_text=_(
+            'SMS message template used for sending verification code.'
+            ' Must contain "{code}" placeholder for OTP value.'
+        ),
+        fallback=app_settings.SMS_MESSAGE_TEMPLATE,
+    )
     sms_meta_data = JSONField(
         null=True,
         blank=True,
@@ -1076,46 +1115,107 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
             'Additional configuration for SMS backend in JSON format (optional)'
         ),
     )
-    freeradius_allowed_hosts = models.TextField(
-        null=True, blank=True, help_text=_GET_IP_LIST_HELP_TEXT,
+    freeradius_allowed_hosts = FallbackTextField(
+        null=True,
+        blank=True,
+        help_text=_GET_IP_LIST_HELP_TEXT,
+        default=','.join(app_settings.FREERADIUS_ALLOWED_HOSTS),
+        fallback=','.join(app_settings.FREERADIUS_ALLOWED_HOSTS),
     )
-    allowed_mobile_prefixes = models.TextField(
-        null=True, blank=True, help_text=_GET_MOBILE_PREFIX_HELP_TEXT,
+    coa_enabled = FallbackBooleanChoiceField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_COA_ENABLED_HELP_TEXT,
+        fallback=app_settings.COA_ENABLED,
+        verbose_name=_('CoA Enabled'),
     )
-    first_name = models.CharField(
+    allowed_mobile_prefixes = FallbackTextField(
+        null=True,
+        blank=True,
+        help_text=_GET_MOBILE_PREFIX_HELP_TEXT,
+        default=','.join(app_settings.ALLOWED_MOBILE_PREFIXES),
+        fallback=','.join(app_settings.ALLOWED_MOBILE_PREFIXES),
+    )
+    first_name = FallbackCharChoiceField(
         verbose_name=_('first name'),
         help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
         max_length=12,
         null=True,
         blank=True,
         choices=OPTIONAL_FIELD_CHOICES,
+        fallback=OPTIONAL_SETTINGS.get('first_name', None),
     )
-    last_name = models.CharField(
+    last_name = FallbackCharChoiceField(
         verbose_name=_('last name'),
         help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
         max_length=12,
         null=True,
         blank=True,
         choices=OPTIONAL_FIELD_CHOICES,
+        fallback=OPTIONAL_SETTINGS.get('last_name', None),
     )
-    location = models.CharField(
+    location = FallbackCharChoiceField(
         verbose_name=_('location'),
         help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
         max_length=12,
         null=True,
         blank=True,
         choices=OPTIONAL_FIELD_CHOICES,
+        fallback=OPTIONAL_SETTINGS.get('location', None),
     )
-    birth_date = models.CharField(
+    birth_date = FallbackCharChoiceField(
         verbose_name=_('birth date'),
         help_text=_GET_OPTIONAL_FIELDS_HELP_TEXT,
         max_length=12,
         null=True,
         blank=True,
         choices=OPTIONAL_FIELD_CHOICES,
+        fallback=OPTIONAL_SETTINGS.get('birth_date', None),
     )
-    registration_enabled = models.BooleanField(
-        null=True, blank=True, default=True, help_text=_REGISTRATION_ENABLED_HELP_TEXT,
+    registration_enabled = FallbackBooleanChoiceField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_REGISTRATION_ENABLED_HELP_TEXT,
+        fallback=app_settings.REGISTRATION_API_ENABLED,
+    )
+    saml_registration_enabled = FallbackBooleanChoiceField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_SAML_REGISTRATION_ENABLED_HELP_TEXT,
+        verbose_name=_('SAML registration enabled'),
+        fallback=app_settings.SAML_REGISTRATION_ENABLED,
+    )
+    social_registration_enabled = FallbackBooleanChoiceField(
+        null=True,
+        blank=True,
+        default=None,
+        help_text=_SOCIAL_REGISTRATION_ENABLED_HELP_TEXT,
+        fallback=app_settings.SOCIAL_REGISTRATION_ENABLED,
+    )
+    login_url = models.URLField(
+        verbose_name=_('Login URL'),
+        null=True,
+        blank=True,
+        help_text=_LOGIN_URL_HELP_TEXT,
+    )
+    status_url = models.URLField(
+        verbose_name=_('Status URL'),
+        null=True,
+        blank=True,
+        help_text=_STATUS_URL_HELP_TEXT,
+    )
+    password_reset_url = FallbackCharField(
+        verbose_name=_('Password reset URL'),
+        null=True,
+        blank=True,
+        max_length=200,
+        help_text=_PASSWORD_RESET_URL_HELP_TEXT,
+        default=DEFAULT_PASSWORD_RESET_URL,
+        fallback=DEFAULT_PASSWORD_RESET_URL,
+        validators=[password_reset_url_validator],
     )
 
     class Meta:
@@ -1140,13 +1240,8 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
             mobile_prefixes = self.allowed_mobile_prefixes.split(',')
         return mobile_prefixes
 
-    def get_registration_enabled(self):
-        if self.registration_enabled is None:
-            return app_settings.REGISTRATION_API_ENABLED
-        return self.registration_enabled
-
     def clean(self):
-        if self.sms_verification and not self.sms_sender:
+        if self.get_setting('sms_verification') and not self.sms_sender:
             raise ValidationError(
                 {
                     'sms_sender': _(
@@ -1156,7 +1251,8 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
             )
         self._clean_freeradius_allowed_hosts()
         self._clean_allowed_mobile_prefixes()
-        self._clean_optional_fields()
+        self._clean_password_reset_url()
+        self._clean_sms_message()
 
     def _clean_freeradius_allowed_hosts(self):
         allowed_hosts_set = set(self.freeradius_allowed_hosts_list)
@@ -1170,6 +1266,8 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
                     )
                 }
             )
+        elif not allowed_hosts_set:
+            self.freeradius_allowed_hosts = None
         elif allowed_hosts_set:
             if allowed_hosts_set == settings_allowed_hosts_set:
                 self.freeradius_allowed_hosts = None
@@ -1202,14 +1300,45 @@ class AbstractOrganizationRadiusSettings(UUIDModel):
                     }
                 )
 
-        if allowed_mobile_prefixes_set == settings_allowed_mobile_prefixes_set:
+        if (
+            not allowed_mobile_prefixes_set
+            or allowed_mobile_prefixes_set == settings_allowed_mobile_prefixes_set
+        ):
             self.allowed_mobile_prefixes = None
 
-    def _clean_optional_fields(self):
-        global_settings = app_settings.OPTIONAL_REGISTRATION_FIELDS
-        for field in ['first_name', 'last_name', 'location', 'birth_date']:
-            if getattr(self, field) == global_settings.get(field):
-                setattr(self, field, None)
+    def _clean_password_reset_url(self):
+        if self.password_reset_url and (
+            '{uid}' not in self.password_reset_url
+            or '{token}' not in self.password_reset_url
+        ):
+            raise ValidationError(
+                {
+                    'password_reset_url': _(
+                        'The URL must contain the "{{token}}" and '
+                        '"{{uid}}" placeholders, eg: {}.'.format(
+                            DEFAULT_PASSWORD_RESET_URL
+                        )
+                    )
+                }
+            )
+
+    def _clean_sms_message(self):
+        if self.sms_message and ('{code}' not in self.sms_message):
+            raise ValidationError(
+                {
+                    'sms_message': _(
+                        'The SMS message must contain the "{{code}}" '
+                        'placeholder, eg: {}.'.format(app_settings.SMS_MESSAGE_TEMPLATE)
+                    )
+                }
+            )
+
+    def get_setting(self, field_name):
+        value = getattr(self, field_name)
+        field = self._meta.get_field(field_name)
+        if value is None and hasattr(field, 'fallback'):
+            return field.fallback
+        return value
 
     def save_cache(self, *args, **kwargs):
         cache.set(self.organization.pk, self.token)
@@ -1315,7 +1444,7 @@ class AbstractPhoneToken(TimeStampedEditableModel):
                 )
             )
         org_radius_settings = org_user.organization.radius_settings
-        message = _('{organization} verification code: {code}').format(
+        message = _(org_radius_settings.get_setting('sms_message')).format(
             organization=org_radius_settings.organization.name, code=self.token
         )
         sms_message = SmsMessage(

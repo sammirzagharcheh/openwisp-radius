@@ -6,7 +6,7 @@ import openvpn_status
 from django.core.management import BaseCommand
 from netaddr import EUI, mac_unix
 
-from ....settings import CALLED_STATION_IDS, OPENVPN_DATETIME_FORMAT
+from .... import settings as app_settings
 from ....utils import load_model
 
 logger = logging.getLogger(__name__)
@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 RE_VIRTUAL_ADDR_MAC = re.compile(
     u'^{0}:{0}:{0}:{0}:{0}:{0}'.format(u'[a-f0-9]{2}'), re.I
 )
-TELNET_CONNECTION_TIMEOUT = 10  # In seconds
+TELNET_CONNECTION_TIMEOUT = 30  # In seconds
 
 RadiusAccounting = load_model('RadiusAccounting')
 
@@ -29,7 +29,7 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
                 tn.write(password.encode('ascii') + b'\n')
             tn.read_until(
                 b'>INFO:OpenVPN Management Interface Version 3 -- type '
-                b'\'help\ for more info',
+                b'\'help\' for more info',
                 timeout=TELNET_CONNECTION_TIMEOUT,
             )
             tn.write('status'.encode('ascii') + b'\n')
@@ -42,19 +42,19 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
         try:
             raw_info = self._get_raw_management_info(host, port, password)
         except ConnectionRefusedError:
-            logger.error(
+            logger.warning(
                 'Unable to establish telnet connection to '
                 f'{host} on {port}. Skipping!'
             )
             return {}
-        except (OSError, TimeoutError) as error:
-            logger.error(
+        except (OSError, TimeoutError, EOFError) as error:
+            logger.warning(
                 f'Error encountered while connecting to {host}:{port}: {error}. '
                 'Skipping!'
             )
             return {}
         except Exception:
-            logger.exception(
+            logger.warning(
                 f'Error encountered while connecting to {host}:{port}. Skipping!'
             )
             return {}
@@ -62,9 +62,9 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
             parsed_info = openvpn_status.parse_status(raw_info)
             return parsed_info.routing_table
         except openvpn_status.ParsingError as error:
-            logger.error(
+            logger.warning(
                 'Unable to parse information received from '
-                f'{host}. ParsingError: {error}. Skipping!',
+                f'{host}:{port}. ParsingError: {error}. Skipping!',
             )
             return {}
 
@@ -74,16 +74,23 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
                 unique_id=unique_id
             )
         except RadiusAccounting.DoesNotExist:
-            logger.error(
+            logger.warning(
                 f'RadiusAccount object with unique_id "{unique_id}" does not exist.'
             )
 
     def _get_called_station_setting(self, radius_session):
         try:
+            organization = radius_session.organization
+            if str(organization.id) in app_settings.CALLED_STATION_IDS:
+                return {
+                    str(organization.id): app_settings.CALLED_STATION_IDS[
+                        str(organization.id)
+                    ]
+                }
+            # organization slug is maintained for backward compatibility
+            # but will removed in future versions
             return {
-                radius_session.organization.slug: CALLED_STATION_IDS[
-                    radius_session.organization.slug
-                ]
+                organization.slug: app_settings.CALLED_STATION_IDS[organization.slug]
             }
         except KeyError:
             logger.error(
@@ -97,7 +104,7 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
     def handle(self, *args, **options):
         unique_id = options.get('unique_id')
         if not unique_id:
-            called_station_id_setting = CALLED_STATION_IDS
+            called_station_id_setting = app_settings.CALLED_STATION_IDS
         else:
             input_radius_session = self._get_radius_session(unique_id)
             if not input_radius_session:
@@ -108,7 +115,7 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
             if not called_station_id_setting:
                 return
 
-        for org_slug, config in called_station_id_setting.items():
+        for org, config in called_station_id_setting.items():
             routing_dict = {}
             for openvpn_config in config['openvpn_config']:
                 routing_dict.update(
@@ -119,17 +126,14 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
                     )
                 )
             if not routing_dict:
-                logger.info(
-                    'No routing information found for '
-                    f'organization with "{org_slug}" slug'
-                )
+                logger.info(f'No routing information found for "{org}" organization')
                 continue
 
             if unique_id:
                 qs = [input_radius_session]
             else:
                 qs = RadiusAccounting.objects.filter(
-                    organization__slug=org_slug,
+                    organization__slug=org,
                     called_station_id__in=config['unconverted_ids'],
                     stop_time__isnull=True,
                 ).iterator()
@@ -141,12 +145,12 @@ class BaseConvertCalledStationIdCommand(BaseCommand):
                     mac_address = RE_VIRTUAL_ADDR_MAC.search(common_name)[0]
                     radius_session.called_station_id = mac_address.replace(':', '-')
                 except KeyError:
-                    logger.warn(
+                    logger.warning(
                         'Failed to find routing information for '
                         f'{radius_session.session_id}. Skipping!'
                     )
                 except (TypeError, IndexError):
-                    logger.warn(
+                    logger.warning(
                         f'Failed to find a MAC address in "{common_name}". '
                         f'Skipping {radius_session.session_id}!'
                     )
@@ -159,7 +163,7 @@ def parse_virtual_address(virtual_address):
     return openvpn_status.utils.parse_vaddr(virtual_address.split('@')[0])
 
 
-openvpn_status.utils.DATETIME_FORMAT_OPENVPN = OPENVPN_DATETIME_FORMAT
+openvpn_status.utils.DATETIME_FORMAT_OPENVPN = app_settings.OPENVPN_DATETIME_FORMAT
 openvpn_status.models.Routing.virtual_address = (
     openvpn_status.descriptors.LabelProperty(
         u'Virtual Address', input_type=parse_virtual_address

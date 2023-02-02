@@ -4,6 +4,7 @@ import uuid
 from unittest import mock
 
 import swapper
+from celery.exceptions import OperationalError
 from dateutil import parser
 from django.contrib.auth import get_user_model
 from django.core.cache import cache
@@ -13,12 +14,13 @@ from django.utils.crypto import get_random_string
 from django.utils.timezone import now
 from freezegun import freeze_time
 
-from openwisp_utils.tests import capture_any_output
+from openwisp_utils.tests import capture_any_output, catch_signal
 
 from ... import registration
 from ... import settings as app_settings
 from ...api.freeradius_views import logger as freeradius_api_logger
 from ...counters.exceptions import MaxQuotaReached, SkipCheck
+from ...signals import radius_accounting_success
 from ...utils import load_model
 from ..mixins import ApiTokenMixin, BaseTestCase
 
@@ -74,7 +76,7 @@ class AcctMixin(object):
 
     @property
     def acct_post_data(self):
-        """ returns a copy of self._acct_data """
+        """returns a copy of self._acct_data"""
         data = self._acct_initial_data.copy()
         data.update(self._acct_post_data.copy())
         return data
@@ -85,6 +87,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
 
     def setUp(self):
         cache.clear()
+        logging.disable(logging.WARNING)
         super().setUp()
 
     def test_invalid_token(self):
@@ -395,7 +398,8 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             }
         )
         self.assertEqual(
-            response.data, expected,
+            response.data,
+            expected,
         )
 
     @capture_any_output()
@@ -406,10 +410,12 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         with self.subTest('SkipCheck'):
             with mock.patch(_BASE_COUNTER_CHECK) as mocked_check:
                 mocked_check.side_effect = SkipCheck(
-                    message='Skip test', level='error', logger=logging,
+                    message='Skip test',
+                    level='error',
+                    logger=logging,
                 )
                 response = self._authorize_user(auth_header=self.auth_header)
-                self.assertEqual(mocked_check.call_count, len(app_settings.COUNTERS))
+                self.assertEqual(mocked_check.call_count, 2)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.data, truncated_accept_response)
 
@@ -432,7 +438,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             with mock.patch(_BASE_COUNTER_CHECK) as mocked_check:
                 mocked_check.side_effect = ValueError('Unexpected error')
                 response = self._authorize_user(auth_header=self.auth_header)
-                self.assertEqual(mocked_check.call_count, len(app_settings.COUNTERS))
+                self.assertEqual(mocked_check.call_count, 2)
                 self.assertEqual(response.status_code, 200)
                 self.assertEqual(response.data, truncated_accept_response)
 
@@ -449,7 +455,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             with mock.patch(_BASE_COUNTER_CHECK) as mocked_check:
                 mocked_check.return_value = 1200
                 response = self._authorize_user(auth_header=self.auth_header)
-                self.assertEqual(mocked_check.call_count, len(app_settings.COUNTERS))
+                self.assertEqual(mocked_check.call_count, 2)
                 self.assertEqual(response.status_code, 200)
                 expected = _AUTH_TYPE_ACCEPT_RESPONSE.copy()
                 expected['Session-Timeout'] = 1200
@@ -460,7 +466,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             with mock.patch(_BASE_COUNTER_CHECK) as mocked_check:
                 mocked_check.return_value = 3000000000
                 response = self._authorize_user(auth_header=self.auth_header)
-                self.assertEqual(mocked_check.call_count, len(app_settings.COUNTERS))
+                self.assertEqual(mocked_check.call_count, 2)
                 self.assertEqual(response.status_code, 200)
                 expected = _AUTH_TYPE_ACCEPT_RESPONSE.copy()
                 expected['Session-Timeout'] = {'op': '=', 'value': '3600'}
@@ -486,7 +492,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
                 mocked_warning.assert_called_once_with(
                     'Session-Timeout value ("broken") cannot be converted to integer.'
                 )
-            self.assertEqual(mocked_check.call_count, len(app_settings.COUNTERS))
+            self.assertEqual(mocked_check.call_count, 2)
             self.assertEqual(response.status_code, 200)
             expected = _AUTH_TYPE_ACCEPT_RESPONSE.copy()
             expected['Session-Timeout'] = 10800
@@ -674,28 +680,71 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         )
 
     @freeze_time(START_DATE)
-    def test_accounting_start_200(self):
+    @mock.patch('openwisp_radius.receivers.send_login_email.delay')
+    def test_accounting_start_200(self, send_login_email):
         self.assertEqual(RadiusAccounting.objects.count(), 0)
         ra = self._create_radius_accounting(**self._acct_initial_data)
         data = self._prep_start_acct_data()
-        response = self.post_json(data)
+        with catch_signal(radius_accounting_success) as handler:
+            response = self.post_json(data)
+        handler.assert_called_once()
+        view = handler.mock_calls[0].kwargs.get('view')
+        self.assertTrue(hasattr(view, 'request'))
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data)
         self.assertEqual(RadiusAccounting.objects.count(), 1)
         ra.refresh_from_db()
         self.assertAcctData(ra, data)
 
-    def test_accounting_start_radius_token_201(self):
+    @mock.patch(
+        'openwisp_radius.receivers.send_login_email.delay', side_effect=OperationalError
+    )
+    @mock.patch('openwisp_radius.receivers.logger')
+    def test_celery_broker_unreachable(self, logger, *args):
+        data = self._prep_start_acct_data()
+        self.post_json(data)
+        logger.warning.assert_called_with('Celery broker is unreachable')
+
+    @mock.patch('openwisp_radius.receivers.send_login_email.delay')
+    def test_accounting_start_radius_token_201(self, send_login_email):
         self._get_org_user()
         self._login_and_obtain_auth_token()
         data = self._prep_start_acct_data()
         data.update(username='tester')
         self.assertEqual(RadiusAccounting.objects.count(), 0)
-        response = self.client.post(
-            self._acct_url, data=json.dumps(data), content_type='application/json',
-        )
+        with catch_signal(radius_accounting_success) as handler:
+            response = self.client.post(
+                self._acct_url,
+                data=json.dumps(data),
+                content_type='application/json',
+            )
+        handler.assert_called_once()
+        send_login_email.assert_called_once()
         self.assertEqual(response.status_code, 201)
         self.assertIsNone(response.data)
+        self.assertEqual(RadiusAccounting.objects.count(), 1)
+
+    @mock.patch('openwisp_radius.receivers.send_login_email.delay')
+    def test_accounting_start_radius_token_201_ppp(self, send_login_email):
+        self._get_org_user()
+        self._login_and_obtain_auth_token()
+        data = self._prep_start_acct_data()
+        data.update(username='tester')
+        # set `framed_protocol` to 'PPP'
+        data.update(framed_protocol='PPP')
+        self.assertEqual(RadiusAccounting.objects.count(), 0)
+        with catch_signal(radius_accounting_success) as handler:
+            response = self.client.post(
+                self._acct_url,
+                data=json.dumps(data),
+                content_type='application/json',
+            )
+        # assert `send_email_on_new_accounting_handler` is called once
+        handler.assert_called_once()
+        # assert `send_login_email` is not called
+        send_login_email.assert_not_called()
+        self.assertIsNone(response.data)
+        self.assertEqual(response.status_code, 201)
         self.assertEqual(RadiusAccounting.objects.count(), 1)
 
     def test_accounting_start_radius_token_expired_200(self):
@@ -705,7 +754,9 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         data = self._prep_start_acct_data()
         data.update(username='tester')
         response = self.client.post(
-            self._acct_url, data=json.dumps(data), content_type='application/json',
+            self._acct_url,
+            data=json.dumps(data),
+            content_type='application/json',
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, b'')
@@ -928,6 +979,23 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         radtoken.refresh_from_db()
         self.assertFalse(radtoken.can_auth)
 
+    @mock.patch.object(
+        app_settings,
+        'DISPOSABLE_RADIUS_USER_TOKEN',
+        False,
+    )
+    def test_user_auth_token_not_disabled_on_stop(self):
+        self._get_org_user()
+        radtoken = self._create_radius_token(can_auth=True)
+        # Send Accounting stop request
+        data = self.acct_post_data
+        data.update(username='tester', status_type='Stop')
+        data = self._get_accounting_params(**data)
+        response = self.post_json(data)
+        self.assertEqual(response.status_code, 201)
+        radtoken.refresh_from_db()
+        self.assertTrue(radtoken.can_auth)
+
     @freeze_time(START_DATE)
     def test_user_auth_token_org_accounting_stop(self):
         self._get_org_user()
@@ -977,6 +1045,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.test_user_auth_token_org_accounting_stop()
 
     @freeze_time(START_DATE)
+    @capture_any_output()
     def test_accounting_400_missing_status_type(self):
         data = self._get_accounting_params(**self.acct_post_data)
         response = self.post_json(data)
@@ -985,6 +1054,7 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(RadiusAccounting.objects.count(), 0)
 
     @freeze_time(START_DATE)
+    @capture_any_output()
     def test_accounting_400_invalid_status_type(self):
         data = self.acct_post_data
         data['status_type'] = 'INVALID'
@@ -995,7 +1065,8 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(RadiusAccounting.objects.count(), 0)
 
     @freeze_time(START_DATE)
-    def test_accounting_400_validation_error(self):
+    @mock.patch('logging.Logger.warn')
+    def test_accounting_400_validation_error(self, mocked_logger):
         data = self.acct_post_data
         data['status_type'] = 'Start'
         del data['nas_ip_address']
@@ -1004,6 +1075,60 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn('nas_ip_address', response.data)
         self.assertEqual(RadiusAccounting.objects.count(), 0)
+        expected_error_string = (
+            '{\'nas_ip_address\': '
+            '[ErrorDetail(string=\'This field is required.\', '
+            'code=\'required\')]}'
+        )
+        mocked_logger.assert_called_with(
+            'Freeradius accounting request failed.\n'
+            f'Error: {expected_error_string}\n'
+            f'Request payload: {data}'
+        )
+
+    @freeze_time(START_DATE)
+    @mock.patch('logging.Logger.warn')
+    @capture_any_output()
+    def test_accounting_interim_update_openwisp_closed_session(self, mocked_logger):
+        org2 = self._create_org(name='org2', slug='org2')
+        org2.radius_settings = OrganizationRadiusSettings.objects.create(
+            organization=org2
+        )
+        org2.save()
+        self.assertEqual(RadiusAccounting.objects.count(), 0)
+
+        # Create RadiusAccounting object with "default" organization
+        data = self.acct_post_data
+        data['status_type'] = 'Interim-Update'
+        data = self._get_accounting_params(**data)
+        response = self.post_json(data)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(RadiusAccounting.objects.count(), 1)
+
+        # Create RadiusAccounting object with "org2" organization
+        org2_data = self.acct_post_data
+        org2_data['status_type'] = 'Interim-Update'
+        org2_data['unique_id'] = '42'
+        org2_data = self._get_accounting_params(**org2_data)
+        response = self.client.post(
+            self._acct_url,
+            data=json.dumps(org2_data),
+            HTTP_AUTHORIZATION=f'Bearer {org2.pk} {org2.radius_settings.token}',
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(RadiusAccounting.objects.count(), 2)
+
+        # Send Interim-Update request for "default" organization
+        # with Authorization header containing "org2" credentials.
+        response = self.client.post(
+            self._acct_url,
+            data=json.dumps(data),
+            HTTP_AUTHORIZATION=f'Bearer {org2.pk} {org2.radius_settings.token}',
+            content_type='application/json',
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data, None)
 
     def test_accounting_list_200(self):
         data1 = self.acct_post_data
@@ -1037,7 +1162,8 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         )
         self._create_radius_accounting(**data3)
         response = self.client.get(
-            f'{self._acct_url}?page_size=1&page=1', HTTP_AUTHORIZATION=self.auth_header,
+            f'{self._acct_url}?page_size=1&page=1',
+            HTTP_AUTHORIZATION=self.auth_header,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -1047,7 +1173,8 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(item['nas_ip_address'], '172.16.64.91')
         self.assertEqual(item['calling_station_id'], '5c:7d:c1:72:a7:3b')
         response = self.client.get(
-            f'{self._acct_url}?page_size=1&page=2', HTTP_AUTHORIZATION=self.auth_header,
+            f'{self._acct_url}?page_size=1&page=2',
+            HTTP_AUTHORIZATION=self.auth_header,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -1057,7 +1184,8 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         self.assertEqual(item['input_octets'], data2['input_octets'])
         self.assertEqual(item['called_station_id'], '00-27-22-F3-FA-F1:hostname')
         response = self.client.get(
-            f'{self._acct_url}?page_size=1&page=3', HTTP_AUTHORIZATION=self.auth_header,
+            f'{self._acct_url}?page_size=1&page=3',
+            HTTP_AUTHORIZATION=self.auth_header,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -1075,7 +1203,8 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         data2.update(dict(username='admin', unique_id='99144d60'))
         self._create_radius_accounting(**data2)
         response = self.client.get(
-            f'{self._acct_url}?username=test_user', HTTP_AUTHORIZATION=self.auth_header,
+            f'{self._acct_url}?username=test_user',
+            HTTP_AUTHORIZATION=self.auth_header,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -1173,14 +1302,16 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
         )
         ra = self._create_radius_accounting(**data2)
         response = self.client.get(
-            f'{self._acct_url}?is_open=true', HTTP_AUTHORIZATION=self.auth_header,
+            f'{self._acct_url}?is_open=true',
+            HTTP_AUTHORIZATION=self.auth_header,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
         item = response.data[0]
         self.assertEqual(item['stop_time'], None)
         response = self.client.get(
-            f'{self._acct_url}?is_open=false', HTTP_AUTHORIZATION=self.auth_header,
+            f'{self._acct_url}?is_open=false',
+            HTTP_AUTHORIZATION=self.auth_header,
         )
         self.assertEqual(len(response.json()), 1)
         self.assertEqual(response.status_code, 200)
@@ -1274,7 +1405,9 @@ class TestFreeradiusApi(AcctMixin, ApiTokenMixin, BaseTestCase):
             "framed_ip_address": "",
         }
         response = self.client.post(
-            self._acct_url, data=json.dumps(data), content_type='application/json',
+            self._acct_url,
+            data=json.dumps(data),
+            content_type='application/json',
         )
         self.assertEqual(response.status_code, 200)
         self.assertIsNone(response.data)
@@ -1523,9 +1656,9 @@ class TestClientIpApi(ApiTokenMixin, BaseTestCase):
         org = self._get_org()
         self.assertEqual(cache.get(f'ip-{org.pk}'), None)
         with self.subTest('Without Cache'):
-            authorize_and_assert(11, [])
+            authorize_and_assert(11, ['127.0.0.1'])
         with self.subTest('With Cache'):
-            authorize_and_assert(8, [])
+            authorize_and_assert(8, ['127.0.0.1'])
         with self.subTest('Organization Settings Updated'):
             radsetting = OrganizationRadiusSettings.objects.get(organization=org)
             radsetting.freeradius_allowed_hosts = '127.0.0.1,192.0.2.0'
@@ -1542,11 +1675,19 @@ class TestClientIpApi(ApiTokenMixin, BaseTestCase):
 
     @capture_any_output()
     def test_ip_from_setting_invalid(self):
+        org = self._get_org()
+        cache.delete(f'ip-{org.pk}')
         test_fail_msg = (
             'Request rejected: (localhost) in organization settings or '
             'settings.py is not a valid IP address. Please contact administrator.'
         )
-        with mock.patch(self.freeradius_hosts_path, ['localhost']):
+        with mock.patch(
+            'openwisp_radius.settings.FREERADIUS_ALLOWED_HOSTS', ['localhost']
+        ), mock.patch.object(
+            OrganizationRadiusSettings._meta.get_field('freeradius_allowed_hosts'),
+            'from_db_value',
+            return_value='localhost',
+        ):
             response = self.client.post(reverse('radius:authorize'), self.params)
         self.assertEqual(response.status_code, 403)
         self.assertEqual(response.data['detail'], test_fail_msg)
@@ -1581,14 +1722,20 @@ class TestClientIpApi(ApiTokenMixin, BaseTestCase):
     @capture_any_output()
     def test_ip_from_radsetting_not_exist(self):
         org2 = self._create_org(**{'name': 'test', 'slug': 'test'})
-        self._create_org_user(**{'organization': org2})
-        self.client.post(reverse('radius:user_auth_token', args=[org2.slug]))
+        user = self._create_user(username='org2-tester', email='tester@org2.com')
+        self._create_org_user(**{'organization': org2, 'user': user})
+        params = self.params.copy()
+        params['username'] = 'org2-tester'
+        response = self.client.post(
+            reverse('radius:user_auth_token', args=[org2.slug]), params
+        )
+        self.assertEqual(response.status_code, 200)
         with self.subTest('FREERADIUS_ALLOWED_HOSTS is 127.0.0.1'):
-            response = self.client.post(reverse('radius:authorize'), self.params)
+            response = self.client.post(reverse('radius:authorize'), params)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.data, _AUTH_TYPE_ACCEPT_RESPONSE)
         with self.subTest('Empty Settings'), mock.patch(self.freeradius_hosts_path, []):
-            response = self.client.post(reverse('radius:authorize'), self.params)
+            response = self.client.post(reverse('radius:authorize'), params)
             self.assertEqual(response.status_code, 403)
             self.assertEqual(response.data['detail'], self.fail_msg)
 

@@ -1,15 +1,15 @@
 from private_storage.views import PrivateStorageDetailView
 
-from ..base.models import _get_csv_file_private_storage
+from ..settings import PRIVATE_STORAGE_INSTANCE
 from ..utils import load_model
 
 
 class RadiusBatchCsvDownloadView(PrivateStorageDetailView):
-    storage = _get_csv_file_private_storage
+    storage = PRIVATE_STORAGE_INSTANCE
     model = load_model('RadiusBatch')
     model_file_field = 'csvfile'
     slug_field = 'csvfile'
-    slug_url_kwarg = 'csvfile'
+    slug_url_kwarg = 'path'
 
     def can_access_file(self, private_file):
         user = private_file.request.user

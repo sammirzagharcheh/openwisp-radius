@@ -38,7 +38,8 @@ class TestApiUserToken(ApiTokenMixin, BaseTestCase):
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.data['key'], Token.objects.first().key)
         self.assertEqual(
-            response.data['radius_user_token'], RadiusToken.objects.first().key,
+            response.data['radius_user_token'],
+            RadiusToken.objects.first().key,
         )
         self.assertTrue(response.data['is_active'])
         self.assertIn('is_verified', response.data)
@@ -58,6 +59,17 @@ class TestApiUserToken(ApiTokenMixin, BaseTestCase):
             org_user.user.phone_number = '+23767778243'
             org_user.save()
             self._user_auth_token_helper(org_user.user.phone_number)
+
+    def test_user_language_preference_stored(self):
+        test_user = self._get_user()
+        self.assertEqual(test_user.language, 'en-gb')
+        self.client.post(
+            self._get_url(),
+            {'username': 'tester', 'password': 'tester'},
+            HTTP_ACCEPT_LANGUAGE='it',
+        )
+        test_user.refresh_from_db()
+        self.assertEqual(test_user.language, 'it')
 
     def test_user_auth_token_with_second_organization(self):
         api_views.renew_required = False
@@ -102,7 +114,8 @@ class TestApiUserToken(ApiTokenMixin, BaseTestCase):
             self.assertEqual(response.status_code, 200)
             self.assertEqual(response.data['key'], Token.objects.first().key)
             self.assertEqual(
-                response.data['radius_user_token'], RadiusToken.objects.first().key,
+                response.data['radius_user_token'],
+                RadiusToken.objects.first().key,
             )
             self.assertEqual(OrganizationUser.objects.count(), 2)
             org_user = OrganizationUser.objects.first()
@@ -163,7 +176,15 @@ class TestApiUserToken(ApiTokenMixin, BaseTestCase):
         url = reverse('radius:user_auth_token', args=[org2.slug])
 
         with self.subTest('Global disabled and organization None'):
-            with mock.patch.object(app_settings, 'REGISTRATION_API_ENABLED', False):
+            with mock.patch.object(
+                app_settings, 'REGISTRATION_API_ENABLED', False
+            ), mock.patch.object(
+                # The fallback value is set on project startup, hence
+                # it also requires mocking.
+                OrganizationRadiusSettings._meta.get_field('registration_enabled'),
+                'fallback',
+                False,
+            ):
                 _assert_registration_disabled()
 
         with self.subTest('Global enabled and organization None'):
@@ -173,11 +194,13 @@ class TestApiUserToken(ApiTokenMixin, BaseTestCase):
 
         with self.subTest('Organization disabled'):
             rad_setting.registration_enabled = False
+            rad_setting.full_clean()
             rad_setting.save()
             _assert_registration_disabled()
 
         with self.subTest('Global enabled and organization None'):
             rad_setting.registration_enabled = True
+            rad_setting.full_clean()
             rad_setting.save()
             _assert_registration_enabled()
 
@@ -282,15 +305,18 @@ class TestApiValidateToken(ApiTokenMixin, BaseTestCase):
         )
         self.assertEqual(response.data['auth_token'], token.key)
         self.assertEqual(
-            response.data['radius_user_token'], RadiusToken.objects.first().key,
+            response.data['radius_user_token'],
+            RadiusToken.objects.first().key,
         )
         user = token.user
         self.assertEqual(user, RadiusToken.objects.first().user)
         self.assertEqual(
-            response.data['username'], user.username,
+            response.data['username'],
+            user.username,
         )
         self.assertEqual(
-            response.data['is_active'], user.is_active,
+            response.data['is_active'],
+            user.is_active,
         )
         if user.is_active:
             phone_number = user.phone_number
@@ -301,10 +327,12 @@ class TestApiValidateToken(ApiTokenMixin, BaseTestCase):
             phone_number = str(phone_number)
 
         self.assertEqual(
-            response.data['phone_number'], phone_number,
+            response.data['phone_number'],
+            phone_number,
         )
         self.assertEqual(
-            response.data['email'], user.email,
+            response.data['email'],
+            user.email,
         )
         self.assertIn('is_verified', response.data)
         self.assertIn('method', response.data)
@@ -313,6 +341,18 @@ class TestApiValidateToken(ApiTokenMixin, BaseTestCase):
     def test_validate_auth_token_with_active_user(self):
         user = self._get_user_with_org()
         self._test_validate_auth_token_helper(user)
+
+    def test_user_language_preference_stored(self):
+        user = self._get_user()
+        token = Token.objects.create(user=user)
+        self.assertEqual(user.language, 'en-gb')
+        self.client.post(
+            self._get_url(),
+            dict(token=token.key),
+            HTTP_ACCEPT_LANGUAGE='ru',
+        )
+        user.refresh_from_db()
+        self.assertEqual(user.language, 'ru')
 
     def test_validate_auth_token_phone_number_null(self):
         user = self._get_user_with_org()

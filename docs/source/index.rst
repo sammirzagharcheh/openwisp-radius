@@ -30,12 +30,11 @@ openwisp-radius
    :target: https://pypi.org/project/black/
    :alt: code style: black
 
-.. image:: images/demo_radius.gif
-   :alt: Feature Highlights
+**OpenWISP-RADIUS** provides an admin interface to a
+`freeradius <https://freeradius.org/>`_ database and offers features
+that are common in WiFi and ISP deployments.
 
-
-**OpenWISP-RADIUS** is Django reusable app that provides an admin interface to a
-`freeradius <https://freeradius.org/>`_ database.
+**Need a quick overview?** `Try the OpenWISP Demo <https://openwisp.org/demo.html>`_.
 
 .. note::
    If you're building a public wifi service, we suggest
@@ -47,10 +46,10 @@ openwisp-radius
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
 
    /developer/setup
    /developer/freeradius
+   /developer/freeradius_wpa_enterprise
    /user/settings
    /user/management_commands
    /user/importing_users
@@ -59,9 +58,12 @@ openwisp-radius
    /user/registration
    /user/social_login
    /user/saml
+   /user/change_of_authorization
    /user/api
+   /developer/signals
    /developer/how_to_extend
    /developer/captive_portal_mock.rst
    /general/support
    /developer/contributing
    /general/goals
+   /general/changelog.rst

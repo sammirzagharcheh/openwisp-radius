@@ -1,13 +1,38 @@
-==============================================
-Installation and configuration of Freeradius 3
-==============================================
+.. _freeradius_setup_for_captive_portal:
 
-This guide explains how to install and configure `freeradius 3 <https://freeradius.org>`_
-in order to make it work with `openwisp-radius <https://github.com/openwisp/openwisp-radius/>`_.
+==================================================
+Freeradius Setup for Captive Portal authentication
+==================================================
+
+This guide explains how to install and configure
+`freeradius 3 <https://freeradius.org>`_
+in order to make it work with
+`OpenWISP RADIUS <https://github.com/openwisp/openwisp-radius/>`_
+for Captive Portal authentication.
+
+The guide is written for debian based systems, other linux
+distributions can work as well but the name of packages and
+files may be different.
+
+Widely used solutions used with OpenWISP RADIUS are PfSense and
+Coova-Chilli, but other solutions can be used as well.
 
 .. note::
-    The guide is written for debian based systems, other linux distributions can work as well but the
-    name of packages and files may be different.
+    Before users can authenticate through a captive portal,
+    they will most likely need to sign up through a web page,
+    or alternatively, they will need to perform social login or
+    some other kind of Single Sign On (SSO).
+
+    The `openwisp-wifi-login-pages
+    <https://github.com/openwisp/openwisp-wifi-login-pages>`_ web app
+    is an open source solution which integrates with
+    OpenWISP RADIUS to provide features like self user registration,
+    social login, SSO/SAML login, SMS verification,
+    simple username & password login using the
+    :ref:`radius_user_token` method.
+
+    For more information see: `openwisp-wifi-login-pages
+    <https://github.com/openwisp/openwisp-wifi-login-pages>`_.
 
 How to install freeradius 3
 ---------------------------
@@ -18,17 +43,12 @@ First of all, become root:
 
     sudo -s
 
-Let's add the PPA repository for the Freeradius 3.x stable branch:
+In order to **install a recent version of FreeRADIUS**, we recommend
+using the `freeradius packages provided by NetworkRADIUS
+<https://networkradius.com/packages/>`_.
 
-.. note::
-    If you use a recent version of Debian like **Stretch** (9) or Ubuntu **Bionic** (18),
-    you should skip the following command and use the official repositories.
-
-.. code-block:: shell
-
-    apt-add-repository ppa:freeradius/stable-3.0
-
-Update the list of available packages:
+After having updated the APT sources list to pull the NetworkRADIUS packages,
+let's proceed to update the list of available packages:
 
 .. code-block:: shell
 
@@ -180,14 +200,32 @@ Example configuration using the PostgreSQL database:
     password = "<password>"
     radius_db = "radius"
 
+.. _freeradius_site:
+
 Configure the site
 ^^^^^^^^^^^^^^^^^^
 
-Configuration of the ``authorize``, ``authenticate`` and ``postauth`` section as follows,
-there are three ways to `authenticate your freeradius instance with openwisp-radius <../user/api.html#request-authentication>`_,
-if you are **not** using `the Radius Token method <../user/api.html#radius-user-token-recommended>`_, please
-substitute the occurrences of ``<api_token>`` & ``<org-uuid>`` with
-the value of `your organization's UUID & api_token values <../user/api.html#bearer-token>`_:
+This section explains how to configure the FreeRADIUS site.
+
+Please refer to :ref:`freeradius_api_authentication` to understand the
+different possibilities with which FreeRADIUS can authenticate requests
+going to OpenWISP RADIUS so that OpenWISP RADIUS knows to which
+organization each request belongs.
+
+If you are **not** using the method described in :ref:`radius_user_token`,
+you have to do the following:
+
+- create one FreeRADIUS site for each organization
+- uncomment the line which starts with ``# api_token_header``
+- substitute the occurrences of ``<org_uuid>`` and
+  ``<org_radius_api_token>`` with the UUID & RADIUS API token of
+  each organization, refer to the section
+  :ref:`organization_uuid_token` for finding these values.
+
+If you are deploying a captive portal setup and can use
+the RADIUS User Token method, you can get away with having
+only one freeradius site for all the organizations and can simply copy
+the configuration shown below.
 
 .. code-block:: ini
 
@@ -196,8 +234,8 @@ the value of `your organization's UUID & api_token values <../user/api.html#bear
 
     server default {
         # if you are not using Radius Token authentication method, please uncomment
-        # and set the values for <org-uuid> & <api_token>
-        # api_token_header = "Authorization: Bearer <org-uuid> <api_token>"
+        # and set the values for <org_uuid> & <org_radius_api_token>
+        # api_token_header = "Authorization: Bearer <org_uuid> <org_radius_api_token>"
 
         authorize {
             # if you are not using Radius Token authentication method, please uncomment the following
@@ -227,7 +265,7 @@ the value of `your organization's UUID & api_token values <../user/api.html#bear
         }
     }
 
-Please also ensure that ``acct_unique`` is present in tge ``pre-accounting`` section:
+Please also ensure that ``acct_unique`` is present in the ``pre-accounting`` section:
 
 .. code-block:: ini
 
@@ -236,6 +274,8 @@ Please also ensure that ``acct_unique`` is present in tge ``pre-accounting`` sec
         acct_unique
         # ...
     }
+
+.. _restart_freeradius:
 
 Restart freeradius to make the configuration effective
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -255,7 +295,7 @@ In case of errors you can run `freeradius in debug mode
 **A common problem, especially during development and testing, is that the
 openwisp-radius application may not be running**, in that case you can find
 out how to run the django development server in the
-`Install for development <./setup.html#installing-for-development>`_ section.
+:ref:`Install for development <installing_for_development>` section.
 
 Also make sure that this server runs on the port specified in
 ``/etc/freeradius/mods-enabled/rest``.
@@ -289,66 +329,32 @@ and add the following code to configure the database:
 Make sure the database by the name ``<db_name>`` is created and also the
 role ``<db_user>`` with ``<db_password>`` as password.
 
-Radius Checks: ``is_active`` & ``valid_until``
-----------------------------------------------
-
-openwisp-radius provides the possibility to extend the freeradius
-query in order to introduce ``is_active`` and ``valid_until`` checks.
-
-An example using MySQL is:
-
-.. code-block:: ini
-
-    # /etc/freeradius/mods-config/sql/main/mysql/queries.conf
-    authorize_check_query = "SELECT id, username, attribute, value, op \
-                             FROM ${authcheck_table} \
-                             WHERE username = '%{SQL-User-Name}' \
-                             AND is_active = TRUE \
-                             AND valid_until >= CURDATE() \
-                             ORDER BY id"
-
 Using Radius Checks for Authorization Information
 -------------------------------------------------
 
-Traditionally, when using an SQL backend with Freeradius, user authorization information such as User-Name and
-`"known good" <https://freeradius.org/radiusd/man/rlm_pap.html>`_ password are stored using the *radcheck*
-table provided by Freeradius' default SQL schema.  openwisp-radius utilizes Freeradius'
-`rlm_rest <https://networkradius.com/doc/current/raddb/mods-available/rest.html>`_ module in order to
-take advantage of the built in user management and authentication capabilities of Django.
-(See :ref:`configure-rest-module` and `User authentication in Django <https://docs.djangoproject.com/en/dev/topics/auth/>`_)
+Traditionally, when using an SQL backend with Freeradius,
+user authorization information such as User-Name and
+`"known good" <https://freeradius.org/radiusd/man/rlm_pap.html>`_
+password can be stored using the *radcheck*
+table provided by Freeradius' default SQL schema.
 
-For existing Freeradius deployments or in cases where it is preferred to utilize Freeradius' *radcheck* table for
-storing user credentials it is possible to utilize `rlm_sql <https://wiki.freeradius.org/modules/Rlm_sql>`_
+OpenWISP RADIUS instead uses the FreeRADIUS
+`rlm_rest <https://networkradius.com/doc/current/raddb/mods-available/rest.html>`_
+module in order to take advantage of the built in user management and
+authentication capabilities of Django
+(for more information about these topics see :ref:`configure-rest-module`
+and `User authentication in Django <https://docs.djangoproject.com/en/dev/topics/auth/>`_).
+
+When migrating from existing FreeRADIUS deployments or in cases where it
+is preferred to use the FreeRADIUS *radcheck* table for storing user
+credentials it is possible to utilize `rlm_sql <https://wiki.freeradius.org/modules/Rlm_sql>`_
 in parallel with (or instead of) `rlm_rest <https://networkradius.com/doc/current/raddb/mods-available/rest.html>`_
 for authorization.
 
 .. note::
-    Bypassing the openwisp-radius' REST API for authorization means you will have to manually create
-    Radius Check 'password' entries for each user you want to authenticate with Freeradius.
-
-Password hashing
-^^^^^^^^^^^^^^^^
-
-By default Django will use `PBKDF2 <https://en.wikipedia.org/wiki/PBKDF2>`_ to store all passwords in the database.
-(See `Password management in Django <https://docs.djangoproject.com/en/dev/topics/auth/passwords/)>`_).
-The default password hashing and storage algorithms in Django are not compatible with those used by Freeradius.
-Therefore, a default set of Freeradius compatible password storage methods have been provided for deployments that make use
-of Radius Checks for user credentials.
-
-* Cleartext-Password
-* NT-Password
-* LM-Password
-* MD5-Password
-* SMD5-Password
-* SHA-Password
-* SSHA-Password
-* Crypt-Password
-
-.. note::
-    Only the Crypt-Password hashing attribute is recommended for new entries as it makes
-    use of the sha512_crypt feature supported by most Unix/Linux operating systems.
-    (See `passlib.hash <https://passlib.readthedocs.io/en/stable/lib/passlib.hash.html#active-unix-hashes>`_)
-    The other password hashing algorithms have been provided for backward compatibility.
+    Bypassing the REST API of openwisp-radius means that you
+    will have to manually create the radius check entries for each user
+    you want to authenticate with FreeRADIUS.
 
 Configuration
 ^^^^^^^^^^^^^
@@ -366,19 +372,7 @@ the ``authorize`` section of your site as follows contains the ``sql`` module:
         # ...
     }
 
-Now you can add new Radius Check entries with one of the
-supported hashing/storage methods mentioned above.
-
-Additional Password Formats
-^^^^^^^^^^^^^^^^^^^^^^^^^^^
-
-Freeradius supports additional password hashing algorithms which are listed in the Freeradius
-`rlm_pap <https://freeradius.org/radiusd/man/rlm_pap.html>`_ documentation.  If your existing
-deployment makes use of one of these or you would like to request an addition to openwisp-radius
-please see the documentation section on :doc:`/developer/contributing`.
-
-Keep in mind that using Radius Checks for accessing user credentials is considered an edge case in openwisp-radius.
-Full compatibility with new and existing features is not guaranteed.
+.. _debugging:
 
 Debugging
 ---------

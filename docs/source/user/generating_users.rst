@@ -1,3 +1,5 @@
+.. _generating_users:
+
 ================
 Generating users
 ================
@@ -18,6 +20,12 @@ There are many features included in it such as:
 
 This operation can be performed via the admin interface,
 with a management command or via the REST API.
+
+.. note::
+   Users imported or generated through this form will be flagged as verified if the
+   organization requires identity verification, otherwise the generated users would
+   not be able to log in. If this organization requires identity verification, make
+   sure the identity of the users is verified before giving out the credentials.
 
 Using the admin interface
 -------------------------
@@ -69,4 +77,4 @@ This command generates users whose usernames start with a particular prefix. Usa
 REST API: Batch user creation
 -----------------------------
 
-See `API documentation: Batch user creation <./api.html#batch-user-creation>`_.
+See API documentation: :ref:`Batch user creation <batch_user_creation>`.
